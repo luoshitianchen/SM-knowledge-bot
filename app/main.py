@@ -13,6 +13,7 @@ from uuid import uuid4
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 import httpx
 from pydantic import BaseModel, Field
 
@@ -75,9 +76,24 @@ def initialize_database() -> None:
                      VALUES ('admin','系统管理员','admin','all',?)""", (now(),))
 
 
+def seed_demo_data() -> None:
+    """创建仅用于本地体验的示例用户和文档，可重复执行。"""
+    with db() as conn:
+        conn.execute("INSERT OR IGNORE INTO users (id,name,role,department,created_at) VALUES ('demo-manager','演示平台主管','manager','engineering',?)", (now(),))
+        exists = conn.execute("SELECT 1 FROM documents WHERE title='示例：研发协作规范'").fetchone()
+        if exists:
+            return
+        document_id = str(uuid4())
+        content = "研发团队的代码评审需要至少一位同事批准。重要变更需附带测试结果，并在合并前更新变更说明。"
+        conn.execute("INSERT INTO documents VALUES (?,?,?,?,?,?)", (document_id, '示例：研发协作规范', 'engineering', 'employee', 'admin', now()))
+        conn.execute("INSERT INTO chunks VALUES (?,?,?,?,?)", (str(uuid4()), document_id, 0, content, " ".join(sorted(normalized_terms(content)))))
+
+
 @app.on_event("startup")
 def startup() -> None:
     initialize_database()
+    if os.getenv("SEED_DEMO_DATA", "true").lower() == "true":
+        seed_demo_data()
 
 
 class CurrentUser(BaseModel):
@@ -223,6 +239,11 @@ def import_github_repository(payload: GitHubImportInput, user: CurrentUser) -> d
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok", "version": app.version}
+
+
+@app.get("/", include_in_schema=False)
+def web_console() -> FileResponse:
+    return FileResponse(Path(__file__).parent / "static" / "index.html")
 
 
 @app.post("/users", status_code=status.HTTP_201_CREATED)

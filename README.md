@@ -24,6 +24,15 @@ uvicorn app.main:app --reload
 
 访问 http://127.0.0.1:8000/docs 使用 Swagger 文档。首次启动自动创建管理员 `admin`；本地开发通过请求头 `X-User-Id: admin` 调用管理员接口。
 
+### 一键启动与浏览器演示
+
+```powershell
+cd C:\Users\Admin\Desktop\github项目\SM-knowledge-bot
+.\start.ps1
+```
+
+然后打开 http://127.0.0.1:8000/ 。项目启动时会自动写入一份“研发协作规范”演示数据；可在页面中同步 GitHub 仓库并立即提问。
+
 ## 快速流程
 
 1. 用 `POST /users` 创建用户（管理员）。
