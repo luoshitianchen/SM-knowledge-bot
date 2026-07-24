@@ -70,6 +70,23 @@ Invoke-RestMethod http://127.0.0.1:8000/chat -Method Post -Headers @{ 'X-User-Id
 docker compose up --build
 ```
 
+## Java（Spring Boot）运行版本
+
+仓库同时提供独立的 Java 21 + Spring Boot 版本，位于 `java` 目录；功能包括 GitHub 导入、RBAC、SQLite 持久化与知识问答 API。
+
+```powershell
+cd C:\Users\Admin\Desktop\github项目\SM-knowledge-bot
+git pull origin main
+cd .\java
+.\start-java.ps1
+```
+
+需要 JDK 21 和 Maven。启动后接口地址为 http://127.0.0.1:8080/health；所有接口沿用 Python 版本的地址与 `X-User-Id` 请求头（默认管理员为 `admin`）。例如：
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:8080/documents/import/github -Method Post -Headers @{ 'X-User-Id' = 'admin' } -ContentType 'application/json' -Body '{"repository_url":"https://github.com/luoshitianchen/SM-knowledge-bot","department":"engineering"}'
+```
+
 ## 生产接入建议
 
 将 `current_user` 替换为企业 SSO/JWT 验证，并以其中的用户 ID、部门及角色作为唯一可信身份来源；将 SQLite 迁移至 PostgreSQL + pgvector/Qdrant；在 `chat` 中将检索出的来源片段传给企业批准的 LLM，并保留现有权限过滤和审计记录。
