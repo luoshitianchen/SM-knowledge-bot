@@ -29,7 +29,7 @@ public class ApiController {
   private static final Map<String, Integer> LEVEL = Map.of("employee", 1, "manager", 2, "admin", 3);
 
   public ApiController(@Value("${app.database-path}") String path) throws Exception {
-    Files.createDirectories(Path.of(path).getParent()); jdbcUrl = "jdbc:sqlite:" + path; initialize();
+    Files.createDirectories(Path.of(path).getParent()); jdbcUrl = "jdbc:sqlite:" + path; initialize(); seedGuide();
   }
   private Connection db() throws SQLException { return DriverManager.getConnection(jdbcUrl); }
   private void initialize() throws SQLException {
@@ -40,6 +40,27 @@ public class ApiController {
       s.executeUpdate("CREATE TABLE IF NOT EXISTS conversations(id TEXT PRIMARY KEY,user_id TEXT,created_at TEXT)");
       s.executeUpdate("CREATE TABLE IF NOT EXISTS messages(id TEXT PRIMARY KEY,conversation_id TEXT,role TEXT,content TEXT,created_at TEXT)");
       s.executeUpdate("INSERT OR IGNORE INTO users VALUES('admin','系统管理员','admin','all')");
+    }
+  }
+  private void seedGuide() throws SQLException {
+    String title="示例：SM Knowledge Bot 操作指南";
+    try(Connection c=db(); PreparedStatement exists=c.prepareStatement("SELECT id FROM documents WHERE title=?")) {
+      exists.setString(1,title); ResultSet result=exists.executeQuery(); if(result.next()) return;
+      String id=UUID.randomUUID().toString();
+      String content="""
+        SM Knowledge Bot 操作指南（内置模拟文件）
+
+        1. 启动服务：进入 java 目录后执行 .\\start-java.ps1，服务默认监听 http://127.0.0.1:8080。
+        2. 检查状态：在浏览器或终端访问 GET /health，返回 status=ok 表示服务已启动。
+        3. 同步 GitHub：以管理员身份向 POST /documents/import/github 提交 repository_url、department 和可选 branch。示例仓库地址为 https://github.com/luoshitianchen/SM-knowledge-bot。
+        4. 提问：向 POST /chat 提交 question；必须使用 X-User-Id 请求头。首次可使用 admin。接口会返回 conversation_id；下一轮问题携带该 conversation_id 即可连续对话。
+        5. 权限：employee 只能问答；manager 和 admin 可以录入文档、同步 GitHub。admin 还可以通过 POST /users 创建用户。
+        6. 本地测试：PowerShell 示例：Invoke-RestMethod http://127.0.0.1:8080/chat -Method Post -Headers @{ 'X-User-Id' = 'admin' } -ContentType 'application/json' -Body '{"question":"如何同步 GitHub 仓库？"}'。
+        """;
+      try(PreparedStatement d=c.prepareStatement("INSERT INTO documents VALUES(?,?,?,?,?,?)"); PreparedStatement q=c.prepareStatement("INSERT INTO chunks VALUES(?,?,?)")) {
+        d.setString(1,id);d.setString(2,title);d.setString(3,"all");d.setString(4,"employee");d.setString(5,"admin");d.setString(6,Instant.now().toString());d.executeUpdate();
+        q.setString(1,UUID.randomUUID().toString());q.setString(2,id);q.setString(3,content);q.executeUpdate();
+      }
     }
   }
   record User(String id,String name,String role,String department) {}

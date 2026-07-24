@@ -87,6 +87,8 @@ cd .\java
 Invoke-RestMethod http://127.0.0.1:8080/documents/import/github -Method Post -Headers @{ 'X-User-Id' = 'admin' } -ContentType 'application/json' -Body '{"repository_url":"https://github.com/luoshitianchen/SM-knowledge-bot","department":"engineering"}'
 ```
 
+Java 服务首次启动会自动写入并索引 `java/demo/操作指南-模拟知识文件.md`。启动后可直接提问“如何同步 GitHub 仓库？”来验证知识检索。
+
 ## 生产接入建议
 
 将 `current_user` 替换为企业 SSO/JWT 验证，并以其中的用户 ID、部门及角色作为唯一可信身份来源；将 SQLite 迁移至 PostgreSQL + pgvector/Qdrant；在 `chat` 中将检索出的来源片段传给企业批准的 LLM，并保留现有权限过滤和审计记录。
