@@ -13,6 +13,7 @@ from uuid import uuid4
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
+import httpx
 from pydantic import BaseModel, Field
 
 DATABASE_PATH = Path(os.getenv("DATABASE_PATH", "data/knowledge_bot.db"))
@@ -152,6 +153,73 @@ class ChatInput(BaseModel):
     conversation_id: str | None = None
 
 
+class GitHubImportInput(BaseModel):
+    repository_url: str = Field(description="GitHub 仓库地址，例如 https://github.com/org/repository")
+    branch: str | None = Field(default=None, max_length=120)
+    department: str = Field(default="all", min_length=1, max_length=80)
+    min_role: Role = "employee"
+    max_files: int = Field(default=50, ge=1, le=200)
+
+
+def github_repository(repository_url: str) -> tuple[str, str]:
+    """解析标准 GitHub HTTPS/SSH 仓库地址。"""
+    match = re.fullmatch(r"(?:https://github\.com/|git@github\.com:)([\w.-]+)/([\w.-]+?)(?:\.git)?/?", repository_url.strip())
+    if not match:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "repository_url 必须是 GitHub 仓库地址")
+    return match.group(1), match.group(2)
+
+
+def github_headers() -> dict[str, str]:
+    headers = {"Accept": "application/vnd.github+json", "User-Agent": "SM-Knowledge-Bot"}
+    # 私有仓库在服务端设置 GITHUB_TOKEN；Token 不经 API 请求传递或持久化。
+    if token := os.getenv("GITHUB_TOKEN"):
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
+
+
+def import_github_repository(payload: GitHubImportInput, user: CurrentUser) -> dict[str, object]:
+    owner, repository = github_repository(payload.repository_url)
+    api_url = f"https://api.github.com/repos/{owner}/{repository}"
+    try:
+        with httpx.Client(timeout=20, headers=github_headers(), follow_redirects=True) as client:
+            repo_response = client.get(api_url)
+            repo_response.raise_for_status()
+            default_branch = payload.branch or repo_response.json()["default_branch"]
+            tree_response = client.get(f"{api_url}/git/trees/{default_branch}?recursive=1")
+            tree_response.raise_for_status()
+            tree = tree_response.json().get("tree", [])
+            paths = [item["path"] for item in tree if item.get("type") == "blob" and item["path"].lower().endswith((".md", ".txt", ".rst", ".py", ".js", ".ts", ".tsx", ".jsx", ".java", ".go", ".json", ".yml", ".yaml"))][:payload.max_files]
+            files: list[tuple[str, str]] = []
+            for path in paths:
+                content_response = client.get(f"https://raw.githubusercontent.com/{owner}/{repository}/{default_branch}/{path}")
+                if content_response.is_success and content_response.text.strip():
+                    files.append((path, content_response.text[:100_000]))
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code in {401, 403, 404}:
+            raise HTTPException(status.HTTP_502_BAD_GATEWAY, "GitHub 仓库不可访问；私有仓库请在服务端配置 GITHUB_TOKEN") from exc
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, "GitHub API 请求失败") from exc
+    except httpx.HTTPError as exc:
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, "连接 GitHub 失败") from exc
+
+    source_prefix = f"github:{owner}/{repository}:{default_branch}:"
+    inserted_chunks = 0
+    with db() as conn:
+        # 同一分支再次同步时，先删除旧索引，避免检索重复。
+        old_documents = conn.execute("SELECT id FROM documents WHERE title LIKE ?", (source_prefix + "%",)).fetchall()
+        for old in old_documents:
+            conn.execute("DELETE FROM chunks WHERE document_id=?", (old["id"],))
+            conn.execute("DELETE FROM documents WHERE id=?", (old["id"],))
+        for path, content in files:
+            document_id = str(uuid4())
+            title = source_prefix + path
+            conn.execute("INSERT INTO documents VALUES (?,?,?,?,?,?)", (document_id, title, payload.department, payload.min_role, user.id, now()))
+            chunks = split_content(content)
+            conn.executemany("INSERT INTO chunks VALUES (?,?,?,?,?)", [(str(uuid4()), document_id, position, chunk, " ".join(sorted(normalized_terms(chunk)))) for position, chunk in enumerate(chunks)])
+            inserted_chunks += len(chunks)
+        audit(conn, user.id, "github.imported", f"{owner}/{repository}", f"branch={default_branch} files={len(files)} chunks={inserted_chunks}")
+    return {"repository": f"{owner}/{repository}", "branch": default_branch, "files": len(files), "chunks": inserted_chunks, "message": "GitHub 仓库已同步到知识库"}
+
+
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok", "version": app.version}
@@ -184,6 +252,17 @@ def create_document(payload: DocumentInput, user: User) -> dict[str, object]:
         conn.executemany("INSERT INTO chunks VALUES (?,?,?,?,?)", [(str(uuid4()), document_id, index, part, " ".join(sorted(normalized_terms(part)))) for index, part in enumerate(chunks)])
         audit(conn, user.id, "document.created", document_id, payload.title)
     return {"id": document_id, "chunks": len(chunks), "message": "文档已写入并完成分块索引"}
+
+
+@app.post("/documents/import/github", status_code=status.HTTP_201_CREATED)
+def import_documents_from_github(payload: GitHubImportInput, user: User) -> dict[str, object]:
+    if user.role == "employee":
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "仅经理或管理员可同步 GitHub 仓库")
+    if ROLE_LEVEL[payload.min_role] > ROLE_LEVEL[user.role]:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "不可创建高于自身角色的权限文档")
+    if user.role != "admin" and payload.department not in {"all", user.department}:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "仅可同步到本部门知识库")
+    return import_github_repository(payload, user)
 
 
 def retrieve(question: str, user: CurrentUser, limit: int = 4) -> list[dict[str, object]]:

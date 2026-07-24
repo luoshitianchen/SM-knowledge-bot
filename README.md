@@ -5,6 +5,7 @@
 ## 已实现能力
 
 - SQLite 持久化：用户、文档、知识块、会话、消息和审计日志；
+- GitHub 仓库同步：通过 GitHub API 拉取 README、文档与常见代码文件并建立索引；
 - RAG 基础检索：中文双字 gram 与英文关键词评分，文档自动分块；
 - 多轮会话：会话归属校验和完整历史查询；
 - RBAC：`employee`、`manager`、`admin`，且检索同时受部门与最低角色限制；
@@ -29,6 +30,21 @@ uvicorn app.main:app --reload
 2. 用 `POST /documents` 录入文档（经理/管理员）。
 3. 用 `POST /chat` 提问；带上实际用户的 `X-User-Id`。
 4. 将返回的 `conversation_id` 传回 `/chat` 保持多轮会话。
+
+## 从 GitHub 导入知识
+
+经理或管理员调用 `POST /documents/import/github` 即可直接拉取 GitHub 仓库内容。系统会读取默认分支（或指定 `branch`）中的 `.md`、`.txt`、`.rst`、`.py`、`.js`、`.ts`、`.json`、`.yml` 等文件；重复同步同一仓库分支会自动替换旧索引。
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:8000/documents/import/github -Method Post -Headers @{ 'X-User-Id' = 'admin' } -ContentType 'application/json' -Body '{"repository_url":"https://github.com/luoshitianchen/SM-knowledge-bot","department":"engineering","min_role":"employee"}'
+```
+
+私有仓库请在服务端环境变量中设置访问 Token：
+
+```powershell
+$env:GITHUB_TOKEN = 'YOUR_GITHUB_TOKEN'
+py -3.11 -m uvicorn app.main:app --reload
+```
 
 ```powershell
 $admin = @{ 'X-User-Id' = 'admin' }
