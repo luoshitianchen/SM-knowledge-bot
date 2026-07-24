@@ -1,110 +1,247 @@
+"""SM Knowledge Bot：具备持久化、检索、会话和 RBAC 的企业知识库 API。"""
 from __future__ import annotations
 
-from collections import defaultdict
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Literal
-from uuid import uuid4
+import hashlib
+import os
 import re
+import sqlite3
+from contextlib import contextmanager
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Annotated, Literal
+from uuid import uuid4
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
+DATABASE_PATH = Path(os.getenv("DATABASE_PATH", "data/knowledge_bot.db"))
+DATABASE_PATH.parent.mkdir(parents=True, exist_ok=True)
+ROLE_LEVEL = {"employee": 1, "manager": 2, "admin": 3}
+Role = Literal["employee", "manager", "admin"]
 
-DATA_DIR = Path("data")
-DATA_DIR.mkdir(exist_ok=True)
-
-app = FastAPI(title="SM Knowledge Bot", version="0.1.0")
+app = FastAPI(title="SM Knowledge Bot", version="1.0.0", description="企业内部知识库问答服务")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    allow_origins=os.getenv("CORS_ORIGINS", "http://localhost:3000").split(","),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
-@dataclass
-class Document:
+@contextmanager
+def db():
+    connection = sqlite3.connect(DATABASE_PATH)
+    connection.row_factory = sqlite3.Row
+    try:
+        yield connection
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def now() -> str:
+    return datetime.now(UTC).isoformat()
+
+
+def initialize_database() -> None:
+    with db() as conn:
+        conn.executescript("""
+        CREATE TABLE IF NOT EXISTS users (
+          id TEXT PRIMARY KEY, name TEXT NOT NULL, role TEXT NOT NULL,
+          department TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS documents (
+          id TEXT PRIMARY KEY, title TEXT NOT NULL, department TEXT NOT NULL,
+          min_role TEXT NOT NULL, created_by TEXT NOT NULL, created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS chunks (
+          id TEXT PRIMARY KEY, document_id TEXT NOT NULL, position INTEGER NOT NULL,
+          content TEXT NOT NULL, terms TEXT NOT NULL, FOREIGN KEY(document_id) REFERENCES documents(id)
+        );
+        CREATE TABLE IF NOT EXISTS conversations (
+          id TEXT PRIMARY KEY, user_id TEXT NOT NULL, title TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS messages (
+          id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL, role TEXT NOT NULL, content TEXT NOT NULL, created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS audit_logs (
+          id TEXT PRIMARY KEY, user_id TEXT NOT NULL, action TEXT NOT NULL, resource_id TEXT, detail TEXT, created_at TEXT NOT NULL
+        );
+        """)
+        conn.execute("""INSERT OR IGNORE INTO users (id,name,role,department,created_at)
+                     VALUES ('admin','系统管理员','admin','all',?)""", (now(),))
+
+
+@app.on_event("startup")
+def startup() -> None:
+    initialize_database()
+
+
+class CurrentUser(BaseModel):
     id: str
-    title: str
-    content: str
+    name: str
+    role: Role
     department: str
-    min_role: str
 
 
-ROLE_LEVEL = {"employee": 1, "manager": 2, "admin": 3}
-documents: list[Document] = []
-conversations: dict[str, list[dict[str, str]]] = defaultdict(list)
+def current_user(x_user_id: Annotated[str | None, Header()] = None) -> CurrentUser:
+    if not x_user_id:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "请提供 X-User-Id 请求头")
+    with db() as conn:
+        row = conn.execute("SELECT * FROM users WHERE id=? AND active=1", (x_user_id,)).fetchone()
+    if not row:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "用户不存在或已被停用")
+    return CurrentUser(**dict(row))
+
+
+User = Annotated[CurrentUser, Depends(current_user)]
+
+
+def require_admin(user: User) -> CurrentUser:
+    if user.role != "admin":
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "需要管理员权限")
+    return user
+
+
+def audit(conn: sqlite3.Connection, user_id: str, action: str, resource_id: str | None = None, detail: str = "") -> None:
+    conn.execute("INSERT INTO audit_logs VALUES (?,?,?,?,?,?)", (str(uuid4()), user_id, action, resource_id, detail, now()))
+
+
+def normalized_terms(text: str) -> set[str]:
+    # 同时保留英文词和中文单字/双字 gram，适合不依赖外部服务的中英文基础检索。
+    latin = re.findall(r"[a-zA-Z0-9_]+", text.lower())
+    chinese = "".join(re.findall(r"[\u4e00-\u9fff]", text))
+    grams = list(chinese) + [chinese[i:i + 2] for i in range(max(0, len(chinese) - 1))]
+    return set(latin + grams)
+
+
+def split_content(content: str, size: int = 500, overlap: int = 80) -> list[str]:
+    content = re.sub(r"\s+", " ", content).strip()
+    if len(content) <= size:
+        return [content]
+    parts, start = [], 0
+    while start < len(content):
+        end = min(start + size, len(content))
+        if end < len(content):
+            boundary = max(content.rfind("。", start, end), content.rfind("\n", start, end), content.rfind(" ", start, end))
+            if boundary > start + size // 2:
+                end = boundary + 1
+        parts.append(content[start:end].strip())
+        start = end - overlap
+    return [part for part in parts if part]
+
+
+class UserInput(BaseModel):
+    id: str = Field(pattern=r"^[a-zA-Z0-9_-]{2,64}$")
+    name: str = Field(min_length=1, max_length=80)
+    role: Role = "employee"
+    department: str = Field(min_length=1, max_length=80)
 
 
 class DocumentInput(BaseModel):
     title: str = Field(min_length=1, max_length=120)
-    content: str = Field(min_length=1)
-    department: str = "all"
-    min_role: Literal["employee", "manager", "admin"] = "employee"
+    content: str = Field(min_length=1, max_length=100_000)
+    department: str = Field(default="all", min_length=1, max_length=80)
+    min_role: Role = "employee"
 
 
 class ChatInput(BaseModel):
     question: str = Field(min_length=1, max_length=2000)
-    user_id: str = Field(min_length=1)
-    role: Literal["employee", "manager", "admin"] = "employee"
-    department: str = "all"
     conversation_id: str | None = None
-
-
-def allowed(document: Document, role: str, department: str) -> bool:
-    return ROLE_LEVEL[role] >= ROLE_LEVEL[document.min_role] and (
-        document.department == "all" or document.department == department
-    )
-
-
-def tokens(text: str) -> set[str]:
-    return set(re.findall(r"[\w\u4e00-\u9fff]+", text.lower()))
-
-
-def retrieve(question: str, role: str, department: str, limit: int = 3) -> list[Document]:
-    query = tokens(question)
-    ranked = []
-    for document in documents:
-        if not allowed(document, role, department):
-            continue
-        score = len(query & tokens(document.title + " " + document.content))
-        if score:
-            ranked.append((score, document))
-    return [document for _, document in sorted(ranked, key=lambda item: item[0], reverse=True)[:limit]]
 
 
 @app.get("/health")
 def health() -> dict[str, str]:
-    return {"status": "ok"}
+    return {"status": "ok", "version": app.version}
 
 
-@app.post("/documents")
-def create_document(payload: DocumentInput) -> dict[str, str]:
-    document = Document(id=str(uuid4()), **payload.model_dump())
-    documents.append(document)
-    return {"id": document.id, "message": "文档已写入知识库"}
+@app.post("/users", status_code=status.HTTP_201_CREATED)
+def create_user(payload: UserInput, user: User) -> dict[str, str]:
+    require_admin(user)
+    with db() as conn:
+        try:
+            conn.execute("INSERT INTO users (id,name,role,department,created_at) VALUES (?,?,?,?,?)", (*payload.model_dump().values(), now()))
+        except sqlite3.IntegrityError as exc:
+            raise HTTPException(status.HTTP_409_CONFLICT, "用户 ID 已存在") from exc
+        audit(conn, user.id, "user.created", payload.id)
+    return {"id": payload.id, "message": "用户已创建"}
+
+
+@app.post("/documents", status_code=status.HTTP_201_CREATED)
+def create_document(payload: DocumentInput, user: User) -> dict[str, object]:
+    if user.role == "employee":
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "仅经理或管理员可录入文档")
+    if ROLE_LEVEL[payload.min_role] > ROLE_LEVEL[user.role]:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "不可创建高于自身角色的权限文档")
+    if user.role != "admin" and payload.department not in {"all", user.department}:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "仅可管理本部门文档")
+    document_id = str(uuid4())
+    chunks = split_content(payload.content)
+    with db() as conn:
+        conn.execute("INSERT INTO documents VALUES (?,?,?,?,?,?)", (document_id, payload.title, payload.department, payload.min_role, user.id, now()))
+        conn.executemany("INSERT INTO chunks VALUES (?,?,?,?,?)", [(str(uuid4()), document_id, index, part, " ".join(sorted(normalized_terms(part)))) for index, part in enumerate(chunks)])
+        audit(conn, user.id, "document.created", document_id, payload.title)
+    return {"id": document_id, "chunks": len(chunks), "message": "文档已写入并完成分块索引"}
+
+
+def retrieve(question: str, user: CurrentUser, limit: int = 4) -> list[dict[str, object]]:
+    query = normalized_terms(question)
+    with db() as conn:
+        rows = conn.execute("""SELECT c.id chunk_id,c.content,d.id document_id,d.title,d.department,d.min_role
+                             FROM chunks c JOIN documents d ON c.document_id=d.id
+                             WHERE (?='admin' OR d.min_role != 'admin')
+                             AND (d.department='all' OR d.department=? OR ?='admin')""", (user.role, user.department, user.role)).fetchall()
+    scored = []
+    for row in rows:
+        if ROLE_LEVEL[user.role] < ROLE_LEVEL[row["min_role"]]:
+            continue
+        document_terms = set(row["content"].lower().split()) | normalized_terms(row["content"])
+        overlap = len(query & document_terms)
+        if overlap:
+            scored.append((overlap / (len(document_terms) ** 0.5), dict(row)))
+    return [item for _, item in sorted(scored, key=lambda result: result[0], reverse=True)[:limit]]
 
 
 @app.post("/chat")
-def chat(payload: ChatInput) -> dict[str, object]:
+def chat(payload: ChatInput, user: User) -> dict[str, object]:
     conversation_id = payload.conversation_id or str(uuid4())
-    history = conversations[conversation_id]
-    sources = retrieve(payload.question, payload.role, payload.department)
-    if sources:
-        excerpts = [f"《{item.title}》：{item.content[:240]}" for item in sources]
-        answer = "根据已授权的知识库内容：\n" + "\n".join(excerpts)
-    else:
-        answer = "在你当前权限可访问的知识库中，未检索到相关内容。"
-    history.extend([
-        {"role": "user", "content": payload.question},
-        {"role": "assistant", "content": answer},
-    ])
-    return {
-        "conversation_id": conversation_id,
-        "answer": answer,
-        "sources": [{"id": item.id, "title": item.title} for item in sources],
-        "history_length": len(history),
-    }
+    sources = retrieve(payload.question, user)
+    with db() as conn:
+        conversation = conn.execute("SELECT user_id FROM conversations WHERE id=?", (conversation_id,)).fetchone()
+        if conversation and conversation["user_id"] != user.id:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "无权访问该会话")
+        if not conversation:
+            conn.execute("INSERT INTO conversations VALUES (?,?,?,?,?)", (conversation_id, user.id, payload.question[:50], now(), now()))
+        history = conn.execute("SELECT role,content FROM messages WHERE conversation_id=? ORDER BY created_at DESC LIMIT 6", (conversation_id,)).fetchall()
+        if sources:
+            evidence = "\n\n".join(f"[{index + 1}] 《{source['title']}》\n{source['content']}" for index, source in enumerate(sources))
+            answer = f"根据当前权限范围内检索到的资料：\n\n{evidence}\n\n以上内容仅基于已检索文档。"
+        else:
+            answer = "当前权限范围内没有检索到可以支撑该问题的知识库内容。"
+        conn.execute("INSERT INTO messages VALUES (?,?,?,?,?)", (str(uuid4()), conversation_id, "user", payload.question, now()))
+        conn.execute("INSERT INTO messages VALUES (?,?,?,?,?)", (str(uuid4()), conversation_id, "assistant", answer, now()))
+        conn.execute("UPDATE conversations SET updated_at=? WHERE id=?", (now(), conversation_id))
+        audit(conn, user.id, "chat.answered", conversation_id, f"sources={len(sources)} history={len(history)}")
+    return {"conversation_id": conversation_id, "answer": answer, "sources": [{"document_id": s["document_id"], "title": s["title"], "chunk_id": s["chunk_id"]} for s in sources]}
+
+
+@app.get("/conversations/{conversation_id}")
+def get_conversation(conversation_id: str, user: User) -> dict[str, object]:
+    with db() as conn:
+        conversation = conn.execute("SELECT * FROM conversations WHERE id=?", (conversation_id,)).fetchone()
+        if not conversation:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "会话不存在")
+        if conversation["user_id"] != user.id and user.role != "admin":
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "无权访问该会话")
+        messages = conn.execute("SELECT role,content,created_at FROM messages WHERE conversation_id=? ORDER BY created_at", (conversation_id,)).fetchall()
+    return {"conversation": dict(conversation), "messages": [dict(row) for row in messages]}
+
+
+@app.get("/audit-logs")
+def list_audit_logs(user: User, limit: int = Query(50, ge=1, le=200)) -> list[dict[str, str]]:
+    require_admin(user)
+    with db() as conn:
+        rows = conn.execute("SELECT * FROM audit_logs ORDER BY created_at DESC LIMIT ?", (limit,)).fetchall()
+    return [dict(row) for row in rows]

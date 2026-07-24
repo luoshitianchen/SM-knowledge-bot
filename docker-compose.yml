@@ -1,0 +1,10 @@
+services:
+  knowledge-bot:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_PATH: /app/data/knowledge_bot.db
+      CORS_ORIGINS: http://localhost:3000
+    volumes:
+      - ./data:/app/data
