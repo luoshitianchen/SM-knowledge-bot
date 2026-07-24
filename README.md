@@ -87,7 +87,7 @@ cd .\java
 Invoke-RestMethod http://127.0.0.1:8080/documents/import/github -Method Post -Headers @{ 'X-User-Id' = 'admin' } -ContentType 'application/json' -Body '{"repository_url":"https://github.com/luoshitianchen/SM-knowledge-bot","department":"engineering"}'
 ```
 
-Java 服务首次启动会自动写入并索引 `java/demo/操作指南-模拟知识文件.md`。启动后可直接提问“如何同步 GitHub 仓库？”来验证知识检索。
+Java 服务启动会自动写入并更新 `java/demo/操作指南-模拟知识文件.md`。该模拟文件提供 `npx skills add` 安装全部/单个 Skill 以及 `git clone` 项目拉取示例；启动后可提问“如何安装全部 Skill？”验证知识检索。
 
 ## 生产接入建议
 
