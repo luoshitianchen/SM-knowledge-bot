@@ -2,9 +2,12 @@ services:
   knowledge-bot:
     build: .
     ports:
-      - "8000:8000"
+      - "${APP_PORT:-8010}:8000"
     environment:
       DATABASE_PATH: /app/data/knowledge_bot.db
-      CORS_ORIGINS: http://localhost:3000
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:8000}
+      GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+      SEED_DEMO_DATA: ${SEED_DEMO_DATA:-true}
     volumes:
       - ./data:/app/data
+    restart: unless-stopped

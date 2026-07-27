@@ -9,14 +9,14 @@
 </head>
 <body><main class="wrap"><header><h1>SM Knowledge Bot</h1><div>GitHub 知识同步 · 权限检索 · 多轮问答</div></header>
 <div class="grid">
-  <section class="card"><h2>当前用户</h2><p class="hint">本地演示默认使用 admin；生产环境接入企业 SSO/JWT。</p><label>X-User-Id</label><input id="userId" value="admin"><button onclick="checkHealth()">检查服务</button><p id="health" class="hint"></p></section>
+  <section class="card"><h2>当前用户</h2><p class="hint">本地演示默认使用 admin；生产环境接入企业 SSO/JWT。</p><label>X-User-Id</label><input id="userId" value="admin"><button onclick="checkHealth()">检查服务</button><p id="health" class="hint"></p><p id="summary" class="hint"></p></section>
   <section class="card"><h2>同步 GitHub 仓库</h2><label>仓库 URL</label><input id="repo" value="https://github.com/luoshitianchen/SM-knowledge-bot"><label>部门</label><input id="department" value="engineering"><label>最大文件数</label><input id="maxFiles" type="number" value="30" min="1" max="200"><button onclick="importRepo()">同步并建立索引</button><p id="importResult" class="hint"></p></section>
   <section class="card wide"><h2>知识库问答</h2><label>问题</label><textarea id="question" placeholder="例如：代码评审有什么要求？">代码评审有什么要求？</textarea><button onclick="ask()">发送问题</button><p class="hint">会话 ID：<span id="conversation">新会话</span></p><div id="answer" class="answer">等待提问…</div><div id="sources" class="hint"></div></section>
 </div></main>
 <script>
 let conversationId=null; const $=id=>document.getElementById(id); const headers=()=>({'Content-Type':'application/json','X-User-Id':$('userId').value.trim()});
 async function api(path,body){const r=await fetch(path,{method:body?'POST':'GET',headers:body?headers():{'X-User-Id':$('userId').value.trim()},body:body?JSON.stringify(body):undefined});const data=await r.json();if(!r.ok)throw new Error(data.detail||'请求失败');return data}
-async function checkHealth(){try{const d=await api('/health');$('health').className='ok';$('health').textContent=`服务正常，版本 ${d.version}`}catch(e){$('health').className='error';$('health').textContent=e.message}}
+async function checkHealth(){try{const d=await api('/health');const s=await api('/api/summary');$('health').className='ok';$('health').textContent=`服务正常，版本 ${d.version}；当前用户：${s.user.name}（${s.user.role}）`;$('summary').textContent=`已索引 ${s.documents} 份文档、${s.chunks} 个知识块、${s.conversations} 个我的会话`}catch(e){$('health').className='error';$('health').textContent=e.message;$('summary').textContent=''}}
 async function importRepo(){const out=$('importResult');out.className='hint';out.textContent='正在从 GitHub 拉取…';try{const d=await api('/documents/import/github',{repository_url:$('repo').value.trim(),department:$('department').value.trim(),max_files:Number($('maxFiles').value)});out.className='ok';out.textContent=`同步完成：${d.repository}，${d.files} 个文件、${d.chunks} 个知识块`}catch(e){out.className='error';out.textContent=e.message}}
 async function ask(){const out=$('answer');out.textContent='正在检索…';try{const d=await api('/chat',{question:$('question').value.trim(),conversation_id:conversationId});conversationId=d.conversation_id;$('conversation').textContent=conversationId;out.textContent=d.answer;$('sources').textContent='来源：'+(d.sources.map(x=>x.title).join('；')||'无')}catch(e){out.textContent=e.message;$('sources').textContent=''}} checkHealth();
 </script></body></html>

@@ -33,6 +33,16 @@ cd C:\Users\Admin\Desktop\github项目\SM-knowledge-bot
 
 然后打开 http://127.0.0.1:8000/ 。项目启动时会自动写入一份“研发协作规范”演示数据；可在页面中同步 GitHub 仓库并立即提问。
 
+### Docker 部署
+
+```powershell
+cd C:\Users\Admin\Desktop\github项目\SM-knowledge-bot
+Copy-Item .env.example .env
+.\deploy.ps1
+```
+
+部署完成后访问 http://127.0.0.1:8010/。容器包含健康检查，SQLite 数据保存在本机 `data/` 目录；若端口冲突，可在 `.env` 修改 `APP_PORT`。私有 GitHub 仓库在 `.env` 中设置 `GITHUB_TOKEN` 后再执行部署。
+
 ## 快速流程
 
 1. 用 `POST /users` 创建用户（管理员）。

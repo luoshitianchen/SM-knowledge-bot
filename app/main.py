@@ -22,7 +22,7 @@ DATABASE_PATH.parent.mkdir(parents=True, exist_ok=True)
 ROLE_LEVEL = {"employee": 1, "manager": 2, "admin": 3}
 Role = Literal["employee", "manager", "admin"]
 
-app = FastAPI(title="SM Knowledge Bot", version="1.0.0", description="企业内部知识库问答服务")
+app = FastAPI(title="SM Knowledge Bot", version="1.1.0", description="企业内部知识库问答服务")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=os.getenv("CORS_ORIGINS", "http://localhost:3000").split(","),
@@ -239,6 +239,20 @@ def import_github_repository(payload: GitHubImportInput, user: CurrentUser) -> d
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok", "version": app.version}
+
+
+@app.get("/api/summary")
+def summary(user: User) -> dict[str, object]:
+    with db() as conn:
+        document_count = conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0]
+        chunk_count = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+        conversation_count = conn.execute("SELECT COUNT(*) FROM conversations WHERE user_id=?", (user.id,)).fetchone()[0]
+    return {
+        "user": user.model_dump(),
+        "documents": document_count,
+        "chunks": chunk_count,
+        "conversations": conversation_count,
+    }
 
 
 @app.get("/", include_in_schema=False)
