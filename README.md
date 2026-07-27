@@ -81,13 +81,20 @@ cd .\java
 .\start-java.ps1
 ```
 
-需要 JDK 21 和 Maven。启动后接口地址为 http://127.0.0.1:8080/health；所有接口沿用 Python 版本的地址与 `X-User-Id` 请求头（默认管理员为 `admin`）。例如：
+需要 JDK 21 和 Maven。启动后打开 http://127.0.0.1:8080/ 使用内置 Web 控制台；接口健康检查地址为 http://127.0.0.1:8080/health。所有接口使用 `X-User-Id` 请求头（默认管理员为 `admin`）。例如：
 
 ```powershell
 Invoke-RestMethod http://127.0.0.1:8080/documents/import/github -Method Post -Headers @{ 'X-User-Id' = 'admin' } -ContentType 'application/json' -Body '{"repository_url":"https://github.com/luoshitianchen/SM-knowledge-bot","department":"engineering"}'
 ```
 
 Java 服务启动会自动写入并更新 `java/demo/操作指南-模拟知识文件.md`。该模拟文件提供 `npx skills add` 安装全部/单个 Skill 以及 `git clone` 项目拉取示例；启动后可提问“如何安装全部 Skill？”验证知识检索。
+
+运行 Java 测试：
+
+```powershell
+cd C:\Users\Admin\Desktop\github项目\SM-knowledge-bot\java
+mvn test
+```
 
 ## 生产接入建议
 
