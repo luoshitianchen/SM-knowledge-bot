@@ -67,6 +67,8 @@ py -3.11 -m uvicorn app.main:app --reload
 
 同步完成后，在首页“网络知识来源”区域可查看文件/知识块数量、再次同步或删除来源。网络请求使用超时与单文件失败跳过策略；若 GitHub API 返回错误，会在来源状态中记录失败原因。
 
+每次成功同步都会写入来源同步历史（时间、状态、文件数和知识块数），可在控制台点击“同步历史”查看。
+
 ```powershell
 $admin = @{ 'X-User-Id' = 'admin' }
 Invoke-RestMethod http://127.0.0.1:8000/users -Method Post -Headers $admin -ContentType 'application/json' -Body '{"id":"finance-manager","name":"财务经理","role":"manager","department":"finance"}'

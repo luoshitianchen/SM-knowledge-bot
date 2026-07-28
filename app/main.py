@@ -77,6 +77,10 @@ def initialize_database() -> None:
           created_by TEXT NOT NULL, last_synced_at TEXT, last_file_count INTEGER NOT NULL DEFAULT 0,
           last_chunk_count INTEGER NOT NULL DEFAULT 0, last_status TEXT NOT NULL DEFAULT 'pending', last_error TEXT
         );
+        CREATE TABLE IF NOT EXISTS source_sync_runs (
+          id TEXT PRIMARY KEY, source_id TEXT NOT NULL, started_at TEXT NOT NULL, finished_at TEXT,
+          status TEXT NOT NULL, file_count INTEGER NOT NULL DEFAULT 0, chunk_count INTEGER NOT NULL DEFAULT 0, error TEXT
+        );
         """)
         conn.execute("""INSERT OR IGNORE INTO users (id,name,role,department,created_at)
                      VALUES ('admin','系统管理员','admin','all',?)""", (now(),))
@@ -84,6 +88,7 @@ def initialize_database() -> None:
 
 def seed_demo_data() -> None:
     """创建仅用于本地体验的示例用户和文档，可重复执行。"""
+    sync_started = now()
     with db() as conn:
         conn.execute("INSERT OR IGNORE INTO users (id,name,role,department,created_at) VALUES ('demo-manager','演示平台主管','manager','engineering',?)", (now(),))
         exists = conn.execute("SELECT 1 FROM documents WHERE title='示例：研发协作规范'").fetchone()
@@ -257,6 +262,7 @@ def import_github_repository(payload: GitHubImportInput, user: CurrentUser) -> d
             conn.execute("""UPDATE knowledge_sources SET branch=?,department=?,min_role=?,last_synced_at=?,last_file_count=?,last_chunk_count=?,last_status='success',last_error=NULL WHERE id=?""", (default_branch, payload.department, payload.min_role, now(), len(files), inserted_chunks, source_id))
         else:
             conn.execute("""INSERT INTO knowledge_sources VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""", (source_id, "github", source_key, default_branch, payload.department, payload.min_role, user.id, now(), len(files), inserted_chunks, "success", None))
+        conn.execute("INSERT INTO source_sync_runs VALUES (?,?,?,?,?,?,?,?)", (str(uuid4()), source_id, sync_started, now(), "success", len(files), inserted_chunks, None))
         audit(conn, user.id, "github.imported", source_id, f"repository={source_key} branch={default_branch} files={len(files)} chunks={inserted_chunks}")
     return {"source_id": source_id, "repository": f"{owner}/{repository}", "branch": default_branch, "files": len(files), "chunks": inserted_chunks, "message": "GitHub 仓库已同步到知识库"}
 
@@ -348,6 +354,18 @@ def sync_source(source_id: str, payload: SourceSyncInput, user: User) -> dict[st
         raise HTTPException(status.HTTP_403_FORBIDDEN, "无权同步该知识来源")
     repository_url = "https://" + source["repository"]
     return import_github_repository(GitHubImportInput(repository_url=repository_url, branch=source["branch"], department=source["department"], min_role=source["min_role"], max_files=payload.max_files), user)
+
+
+@app.get("/sources/{source_id}/runs")
+def list_source_runs(source_id: str, user: User, limit: int = Query(20, ge=1, le=100)) -> list[dict[str, object]]:
+    with db() as conn:
+        source = conn.execute("SELECT department FROM knowledge_sources WHERE id=?", (source_id,)).fetchone()
+        if not source:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "知识来源不存在")
+        if user.role != "admin" and source["department"] not in {"all", user.department}:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "无权查看该知识来源")
+        rows = conn.execute("SELECT * FROM source_sync_runs WHERE source_id=? ORDER BY started_at DESC LIMIT ?", (source_id, limit)).fetchall()
+    return [dict(row) for row in rows]
 
 
 @app.delete("/sources/{source_id}")
