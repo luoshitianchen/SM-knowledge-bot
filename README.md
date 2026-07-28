@@ -25,6 +25,18 @@ uvicorn app.main:app --reload
 
 访问 http://127.0.0.1:8000/docs 使用 Swagger 文档。首次启动自动创建管理员 `admin`；本地开发通过请求头 `X-User-Id: admin` 调用管理员接口。
 
+## ERP 登录联动
+
+开发环境默认使用 `AUTH_MODE=local`，登录页可用账号 `admin`。企业部署时在 `.env` 配置：
+
+```text
+AUTH_MODE=erp
+ERP_AUTH_URL=https://ERP_HOST/api/auth/login
+ERP_API_KEY=ERP_SERVICE_KEY
+```
+
+系统会以 `username` 和 `password` 调用 ERP 认证接口，不保存密码。ERP 接口需返回用户字段 `id`、`name`、`department`、`role`；若字段名不同，可通过 `ERP_*_FIELD` 环境变量映射。支持的角色为 `employee`、`manager`、`admin`。
+
 ### 一键启动与浏览器演示
 
 ```powershell

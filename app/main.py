@@ -198,7 +198,8 @@ class UserInput(BaseModel):
 
 
 class LoginInput(BaseModel):
-    user_id: str = Field(min_length=1, max_length=64)
+    username: str = Field(min_length=1, max_length=128)
+    password: str = Field(default="", max_length=256)
 
 
 class DocumentInput(BaseModel):
@@ -254,6 +255,7 @@ def import_github_repository(payload: GitHubImportInput, user: CurrentUser) -> d
     owner, repository = github_repository(payload.repository_url)
     api_url = f"https://api.github.com/repos/{owner}/{repository}"
     source_key = f"github.com/{owner}/{repository}"
+    sync_started = now()
     try:
         with httpx.Client(timeout=httpx.Timeout(10, connect=5), headers=github_headers(), follow_redirects=True) as client:
             repo_response = client.get(api_url)
@@ -316,9 +318,49 @@ def health() -> dict[str, str]:
 
 @app.post("/auth/login")
 def login(payload: LoginInput) -> dict[str, object]:
-    """本地演示登录：生产环境应由企业 SSO/JWT 替换。"""
+    """本地开发或 ERP REST 认证入口，不保存用户密码。"""
+    auth_mode = os.getenv("AUTH_MODE", "local").lower()
+    if auth_mode == "erp":
+        erp_url = os.getenv("ERP_AUTH_URL")
+        if not erp_url:
+            raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "ERP 登录尚未配置 ERP_AUTH_URL")
+        headers = {"Accept": "application/json"}
+        if api_key := os.getenv("ERP_API_KEY"):
+            headers["X-API-Key"] = api_key
+        try:
+            response = httpx.post(
+                erp_url,
+                headers=headers,
+                json={"username": payload.username, "password": payload.password},
+                timeout=httpx.Timeout(10, connect=5),
+                verify=os.getenv("ERP_VERIFY_TLS", "true").lower() == "true",
+            )
+            response.raise_for_status()
+            profile = response.json()
+        except httpx.HTTPStatusError as exc:
+            raise HTTPException(status.HTTP_401_UNAUTHORIZED, "ERP 账号或密码错误") from exc
+        except (httpx.HTTPError, ValueError) as exc:
+            raise HTTPException(status.HTTP_502_BAD_GATEWAY, "ERP 登录服务暂时不可用") from exc
+        # ERP 响应默认格式：id、name、department、role；可按实际 ERP 配置字段名。
+        try:
+            user_id = str(profile[os.getenv("ERP_USER_ID_FIELD", "id")])
+            name = str(profile[os.getenv("ERP_NAME_FIELD", "name")])
+            department = str(profile[os.getenv("ERP_DEPARTMENT_FIELD", "department")])
+            role = str(profile[os.getenv("ERP_ROLE_FIELD", "role")]).lower()
+        except (KeyError, TypeError) as exc:
+            raise HTTPException(status.HTTP_502_BAD_GATEWAY, "ERP 用户信息缺少 id、name、department 或 role 字段") from exc
+        if role not in ROLE_LEVEL:
+            role = os.getenv("ERP_DEFAULT_ROLE", "employee")
+        with db() as conn:
+            conn.execute("""INSERT INTO users (id,name,role,department,active,created_at) VALUES (?,?,?,?,1,?)
+                         ON CONFLICT(id) DO UPDATE SET name=excluded.name,role=excluded.role,department=excluded.department,active=1""", (user_id, name, role, department, now()))
+            audit(conn, user_id, "erp.login", detail=f"department={department} role={role}")
+    elif auth_mode == "local":
+        user_id = payload.username
+    else:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "AUTH_MODE 必须为 local 或 erp")
     with db() as conn:
-        row = conn.execute("SELECT * FROM users WHERE id=? AND active=1", (payload.user_id,)).fetchone()
+        row = conn.execute("SELECT * FROM users WHERE id=? AND active=1", (user_id,)).fetchone()
     if not row:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "账号不存在或已停用")
     user = CurrentUser(**dict(row))

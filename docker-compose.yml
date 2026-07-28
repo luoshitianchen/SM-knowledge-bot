@@ -8,6 +8,15 @@ services:
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:8000}
       GITHUB_TOKEN: ${GITHUB_TOKEN:-}
       SEED_DEMO_DATA: ${SEED_DEMO_DATA:-true}
+      AUTH_MODE: ${AUTH_MODE:-local}
+      ERP_AUTH_URL: ${ERP_AUTH_URL:-}
+      ERP_API_KEY: ${ERP_API_KEY:-}
+      ERP_VERIFY_TLS: ${ERP_VERIFY_TLS:-true}
+      ERP_USER_ID_FIELD: ${ERP_USER_ID_FIELD:-id}
+      ERP_NAME_FIELD: ${ERP_NAME_FIELD:-name}
+      ERP_DEPARTMENT_FIELD: ${ERP_DEPARTMENT_FIELD:-department}
+      ERP_ROLE_FIELD: ${ERP_ROLE_FIELD:-role}
+      ERP_DEFAULT_ROLE: ${ERP_DEFAULT_ROLE:-employee}
     volumes:
       - ./data:/app/data
     restart: unless-stopped
