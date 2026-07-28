@@ -49,3 +49,12 @@ def test_agents_can_be_created_and_used_with_restricted_scope():
         result = client.post("/chat", headers=admin, json={"question": "研发协作规范", "agent_id": agent_id})
         assert result.status_code == 200
         assert result.json()["agent"]["id"] == agent_id
+
+
+def test_local_login_returns_active_user():
+    Path(os.environ["DATABASE_PATH"]).unlink(missing_ok=True)
+    with TestClient(app) as client:
+        login = client.post("/auth/login", json={"user_id": "admin"})
+        assert login.status_code == 200
+        assert login.json()["user"]["role"] == "admin"
+        assert client.post("/auth/login", json={"user_id": "unknown"}).status_code == 401

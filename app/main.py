@@ -197,6 +197,10 @@ class UserInput(BaseModel):
     department: str = Field(min_length=1, max_length=80)
 
 
+class LoginInput(BaseModel):
+    user_id: str = Field(min_length=1, max_length=64)
+
+
 class DocumentInput(BaseModel):
     title: str = Field(min_length=1, max_length=120)
     content: str = Field(min_length=1, max_length=100_000)
@@ -308,6 +312,17 @@ def import_github_repository(payload: GitHubImportInput, user: CurrentUser) -> d
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok", "version": app.version}
+
+
+@app.post("/auth/login")
+def login(payload: LoginInput) -> dict[str, object]:
+    """本地演示登录：生产环境应由企业 SSO/JWT 替换。"""
+    with db() as conn:
+        row = conn.execute("SELECT * FROM users WHERE id=? AND active=1", (payload.user_id,)).fetchone()
+    if not row:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "账号不存在或已停用")
+    user = CurrentUser(**dict(row))
+    return {"message": "登录成功", "user": user.model_dump()}
 
 
 @app.get("/api/summary")
