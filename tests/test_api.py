@@ -33,3 +33,19 @@ def test_sources_are_scoped_to_department():
             conn.execute("INSERT INTO knowledge_sources VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", ("source-1", "github", "github.com/acme/engineering", "main", "engineering", "employee", "admin", now(), 1, 2, "success", None))
         assert len(client.get("/sources", headers=admin).json()) == 1
         assert len(client.get("/sources", headers={"X-User-Id": "eng-manager"}).json()) == 1
+
+
+def test_agents_can_be_created_and_used_with_restricted_scope():
+    Path(os.environ["DATABASE_PATH"]).unlink(missing_ok=True)
+    with TestClient(app) as client:
+        admin = {"X-User-Id": "admin"}
+        response = client.post("/agents", headers=admin, json={
+            "name": "测试 Agent", "description": "测试受控问答", "department": "all",
+            "max_role": "employee", "system_prompt": "只引用授权知识。",
+        })
+        assert response.status_code == 201
+        agent_id = response.json()["id"]
+        assert any(agent["id"] == agent_id for agent in client.get("/agents", headers=admin).json())
+        result = client.post("/chat", headers=admin, json={"question": "研发协作规范", "agent_id": agent_id})
+        assert result.status_code == 200
+        assert result.json()["agent"]["id"] == agent_id

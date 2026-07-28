@@ -83,6 +83,11 @@ def initialize_database() -> None:
           id TEXT PRIMARY KEY, source_id TEXT NOT NULL, started_at TEXT NOT NULL, finished_at TEXT,
           status TEXT NOT NULL, file_count INTEGER NOT NULL DEFAULT 0, chunk_count INTEGER NOT NULL DEFAULT 0, error TEXT
         );
+        CREATE TABLE IF NOT EXISTS agents (
+          id TEXT PRIMARY KEY, name TEXT NOT NULL, description TEXT NOT NULL,
+          department TEXT NOT NULL, max_role TEXT NOT NULL, system_prompt TEXT NOT NULL,
+          active INTEGER NOT NULL DEFAULT 1, created_by TEXT NOT NULL, created_at TEXT NOT NULL
+        );
         CREATE INDEX IF NOT EXISTS idx_users_active ON users(id, active);
         CREATE INDEX IF NOT EXISTS idx_documents_visibility ON documents(department, min_role);
         CREATE INDEX IF NOT EXISTS idx_chunks_document ON chunks(document_id);
@@ -90,11 +95,15 @@ def initialize_database() -> None:
         CREATE INDEX IF NOT EXISTS idx_messages_conversation_created ON messages(conversation_id, created_at);
         CREATE INDEX IF NOT EXISTS idx_audit_logs_created ON audit_logs(created_at DESC);
         CREATE INDEX IF NOT EXISTS idx_source_runs_source_started ON source_sync_runs(source_id, started_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_agents_active_department ON agents(active, department);
         """)
         conn.execute("PRAGMA journal_mode = WAL")
         conn.execute("PRAGMA synchronous = NORMAL")
         conn.execute("""INSERT OR IGNORE INTO users (id,name,role,department,created_at)
                      VALUES ('admin','系统管理员','admin','all',?)""", (now(),))
+        conn.execute("""INSERT OR IGNORE INTO agents VALUES
+                     ('agent-general','知识助手','面向全员的企业知识问答助手','all','employee','请基于授权知识库内容回答，内容不足时明确说明。',1,'admin',?),
+                     ('agent-engineering','研发助手','聚焦研发规范、代码协作和技术资料','engineering','manager','请优先引用研发资料，以清晰的步骤形式回答。',1,'admin',?)""", (now(), now()))
 
 
 def seed_demo_data() -> None:
@@ -198,6 +207,15 @@ class DocumentInput(BaseModel):
 class ChatInput(BaseModel):
     question: str = Field(min_length=1, max_length=2000)
     conversation_id: str | None = None
+    agent_id: str | None = None
+
+
+class AgentInput(BaseModel):
+    name: str = Field(min_length=2, max_length=80)
+    description: str = Field(min_length=2, max_length=240)
+    department: str = Field(default="all", min_length=1, max_length=80)
+    max_role: Role = "employee"
+    system_prompt: str = Field(min_length=2, max_length=1000)
 
 
 class GitHubImportInput(BaseModel):
@@ -298,11 +316,13 @@ def summary(user: User) -> dict[str, object]:
         document_count = conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0]
         chunk_count = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
         conversation_count = conn.execute("SELECT COUNT(*) FROM conversations WHERE user_id=?", (user.id,)).fetchone()[0]
+        agent_count = conn.execute("SELECT COUNT(*) FROM agents WHERE active=1").fetchone()[0]
     return {
         "user": user.model_dump(),
         "documents": document_count,
         "chunks": chunk_count,
         "conversations": conversation_count,
+        "agents": agent_count,
     }
 
 
@@ -321,6 +341,34 @@ def create_user(payload: UserInput, user: User) -> dict[str, str]:
             raise HTTPException(status.HTTP_409_CONFLICT, "用户 ID 已存在") from exc
         audit(conn, user.id, "user.created", payload.id)
     return {"id": payload.id, "message": "用户已创建"}
+
+
+@app.get("/agents")
+def list_agents(user: User) -> list[dict[str, object]]:
+    with db() as conn:
+        rows = conn.execute("SELECT * FROM agents WHERE active=1 ORDER BY created_at").fetchall()
+    return [dict(row) for row in rows if (row["department"] in {"all", user.department} or user.role == "admin") and ROLE_LEVEL[user.role] >= ROLE_LEVEL[row["max_role"]]]
+
+
+@app.post("/agents", status_code=status.HTTP_201_CREATED)
+def create_agent(payload: AgentInput, user: User) -> dict[str, str]:
+    require_admin(user)
+    agent_id = str(uuid4())
+    with db() as conn:
+        conn.execute("INSERT INTO agents VALUES (?,?,?,?,?,?,?,?,?)", (agent_id, payload.name, payload.description, payload.department, payload.max_role, payload.system_prompt, 1, user.id, now()))
+        audit(conn, user.id, "agent.created", agent_id, payload.name)
+    return {"id": agent_id, "message": "AI Agent 已创建"}
+
+
+@app.delete("/agents/{agent_id}")
+def archive_agent(agent_id: str, user: User) -> dict[str, str]:
+    require_admin(user)
+    with db() as conn:
+        if not conn.execute("SELECT 1 FROM agents WHERE id=?", (agent_id,)).fetchone():
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "AI Agent 不存在")
+        conn.execute("UPDATE agents SET active=0 WHERE id=?", (agent_id,))
+        audit(conn, user.id, "agent.archived", agent_id)
+    return {"message": "AI Agent 已停用"}
 
 
 @app.post("/documents", status_code=status.HTTP_201_CREATED)
@@ -427,7 +475,21 @@ def retrieve(question: str, user: CurrentUser, limit: int = 4) -> list[dict[str,
 @app.post("/chat")
 def chat(payload: ChatInput, user: User) -> dict[str, object]:
     conversation_id = payload.conversation_id or str(uuid4())
-    sources = retrieve(payload.question, user)
+    agent = None
+    effective_user = user
+    if payload.agent_id:
+        with db() as conn:
+            row = conn.execute("SELECT * FROM agents WHERE id=? AND active=1", (payload.agent_id,)).fetchone()
+        if not row:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "AI Agent 不存在或已停用")
+        agent = dict(row)
+        if agent["department"] not in {"all", user.department} and user.role != "admin":
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "无权使用该 AI Agent")
+        # Agent 仅可收缩权限：调用用户权限与 Agent 上限取较低值。
+        effective_role = min(ROLE_LEVEL[user.role], ROLE_LEVEL[agent["max_role"]])
+        effective_department = user.department if agent["department"] == "all" else agent["department"]
+        effective_user = CurrentUser(id=user.id, name=user.name, role=next(role for role, level in ROLE_LEVEL.items() if level == effective_role), department=effective_department)
+    sources = retrieve(payload.question, effective_user)
     with db() as conn:
         conversation = conn.execute("SELECT user_id FROM conversations WHERE id=?", (conversation_id,)).fetchone()
         if conversation and conversation["user_id"] != user.id:
@@ -437,14 +499,15 @@ def chat(payload: ChatInput, user: User) -> dict[str, object]:
         history = conn.execute("SELECT role,content FROM messages WHERE conversation_id=? ORDER BY created_at DESC LIMIT 6", (conversation_id,)).fetchall()
         if sources:
             evidence = "\n\n".join(f"[{index + 1}] 《{source['title']}》\n{source['content']}" for index, source in enumerate(sources))
-            answer = f"根据当前权限范围内检索到的资料：\n\n{evidence}\n\n以上内容仅基于已检索文档。"
+            prefix = f"{agent['name']}：\n" if agent else ""
+            answer = f"{prefix}根据当前权限范围内检索到的资料：\n\n{evidence}\n\n以上内容仅基于已检索文档。"
         else:
             answer = "当前权限范围内没有检索到可以支撑该问题的知识库内容。"
         conn.execute("INSERT INTO messages VALUES (?,?,?,?,?)", (str(uuid4()), conversation_id, "user", payload.question, now()))
         conn.execute("INSERT INTO messages VALUES (?,?,?,?,?)", (str(uuid4()), conversation_id, "assistant", answer, now()))
         conn.execute("UPDATE conversations SET updated_at=? WHERE id=?", (now(), conversation_id))
-        audit(conn, user.id, "chat.answered", conversation_id, f"sources={len(sources)} history={len(history)}")
-    return {"conversation_id": conversation_id, "answer": answer, "sources": [{"document_id": s["document_id"], "title": s["title"], "chunk_id": s["chunk_id"]} for s in sources]}
+        audit(conn, user.id, "chat.answered", conversation_id, f"agent={agent['id'] if agent else 'default'} sources={len(sources)} history={len(history)}")
+    return {"conversation_id": conversation_id, "agent": {"id": agent["id"], "name": agent["name"]} if agent else None, "answer": answer, "sources": [{"document_id": s["document_id"], "title": s["title"], "chunk_id": s["chunk_id"]} for s in sources]}
 
 
 @app.get("/conversations/{conversation_id}")
