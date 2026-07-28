@@ -11,6 +11,7 @@
 - RBAC：`employee`、`manager`、`admin`，且检索同时受部门与最低角色限制；
 - 管理员可创建用户、查看审计日志；经理/管理员可写入本部门知识；
 - Docker 部署配置和 API 自动化测试。
+- SQLite 并发优化：WAL 模式、15 秒繁忙重试、查询索引和 `X-Process-Time-Ms` 请求耗时响应头。
 
 ## 本地运行
 

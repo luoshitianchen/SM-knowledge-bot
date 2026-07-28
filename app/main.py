@@ -1,7 +1,6 @@
 """SM Knowledge Bot：具备持久化、检索、会话和 RBAC 的企业知识库 API。"""
 from __future__ import annotations
 
-import hashlib
 import os
 import re
 import sqlite3
@@ -11,7 +10,7 @@ from pathlib import Path
 from typing import Annotated, Literal
 from uuid import uuid4
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 import httpx
@@ -22,7 +21,7 @@ DATABASE_PATH.parent.mkdir(parents=True, exist_ok=True)
 ROLE_LEVEL = {"employee": 1, "manager": 2, "admin": 3}
 Role = Literal["employee", "manager", "admin"]
 
-app = FastAPI(title="SM Knowledge Bot", version="1.1.0", description="企业内部知识库问答服务")
+app = FastAPI(title="SM Knowledge Bot", version="1.2.0", description="企业内部知识库问答服务")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=os.getenv("CORS_ORIGINS", "http://localhost:3000").split(","),
@@ -34,8 +33,11 @@ app.add_middleware(
 
 @contextmanager
 def db():
-    connection = sqlite3.connect(DATABASE_PATH)
+    # WAL 允许读取与写入并行，busy_timeout 避免并发短暂写锁直接导致请求失败。
+    connection = sqlite3.connect(DATABASE_PATH, timeout=15)
     connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA foreign_keys = ON")
+    connection.execute("PRAGMA busy_timeout = 15000")
     try:
         yield connection
         connection.commit()
@@ -81,14 +83,22 @@ def initialize_database() -> None:
           id TEXT PRIMARY KEY, source_id TEXT NOT NULL, started_at TEXT NOT NULL, finished_at TEXT,
           status TEXT NOT NULL, file_count INTEGER NOT NULL DEFAULT 0, chunk_count INTEGER NOT NULL DEFAULT 0, error TEXT
         );
+        CREATE INDEX IF NOT EXISTS idx_users_active ON users(id, active);
+        CREATE INDEX IF NOT EXISTS idx_documents_visibility ON documents(department, min_role);
+        CREATE INDEX IF NOT EXISTS idx_chunks_document ON chunks(document_id);
+        CREATE INDEX IF NOT EXISTS idx_conversations_user_updated ON conversations(user_id, updated_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_messages_conversation_created ON messages(conversation_id, created_at);
+        CREATE INDEX IF NOT EXISTS idx_audit_logs_created ON audit_logs(created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_source_runs_source_started ON source_sync_runs(source_id, started_at DESC);
         """)
+        conn.execute("PRAGMA journal_mode = WAL")
+        conn.execute("PRAGMA synchronous = NORMAL")
         conn.execute("""INSERT OR IGNORE INTO users (id,name,role,department,created_at)
                      VALUES ('admin','系统管理员','admin','all',?)""", (now(),))
 
 
 def seed_demo_data() -> None:
     """创建仅用于本地体验的示例用户和文档，可重复执行。"""
-    sync_started = now()
     with db() as conn:
         conn.execute("INSERT OR IGNORE INTO users (id,name,role,department,created_at) VALUES ('demo-manager','演示平台主管','manager','engineering',?)", (now(),))
         exists = conn.execute("SELECT 1 FROM documents WHERE title='示例：研发协作规范'").fetchone()
@@ -105,6 +115,16 @@ def startup() -> None:
     initialize_database()
     if os.getenv("SEED_DEMO_DATA", "true").lower() == "true":
         seed_demo_data()
+
+
+@app.middleware("http")
+async def add_request_timing(request: Request, call_next):
+    """为控制台和监控提供轻量级请求耗时指标。"""
+    started = datetime.now(UTC)
+    response = await call_next(request)
+    elapsed_ms = (datetime.now(UTC) - started).total_seconds() * 1000
+    response.headers["X-Process-Time-Ms"] = f"{elapsed_ms:.2f}"
+    return response
 
 
 class CurrentUser(BaseModel):
