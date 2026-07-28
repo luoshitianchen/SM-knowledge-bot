@@ -21,3 +21,15 @@ def test_rbac_retrieval_and_conversation():
         assert allowed.json()["sources"]
         conversation_id = allowed.json()["conversation_id"]
         assert client.get(f"/conversations/{conversation_id}", headers={"X-User-Id": "fin-manager"}).status_code == 200
+
+
+def test_sources_are_scoped_to_department():
+    Path(os.environ["DATABASE_PATH"]).unlink(missing_ok=True)
+    with TestClient(app) as client:
+        admin = {"X-User-Id": "admin"}
+        client.post("/users", headers=admin, json={"id": "eng-manager", "name": "研发经理", "role": "manager", "department": "engineering"})
+        from app.main import db, now
+        with db() as conn:
+            conn.execute("INSERT INTO knowledge_sources VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", ("source-1", "github", "github.com/acme/engineering", "main", "engineering", "employee", "admin", now(), 1, 2, "success", None))
+        assert len(client.get("/sources", headers=admin).json()) == 1
+        assert len(client.get("/sources", headers={"X-User-Id": "eng-manager"}).json()) == 1

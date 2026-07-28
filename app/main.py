@@ -71,6 +71,12 @@ def initialize_database() -> None:
         CREATE TABLE IF NOT EXISTS audit_logs (
           id TEXT PRIMARY KEY, user_id TEXT NOT NULL, action TEXT NOT NULL, resource_id TEXT, detail TEXT, created_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS knowledge_sources (
+          id TEXT PRIMARY KEY, source_type TEXT NOT NULL, repository TEXT NOT NULL UNIQUE,
+          branch TEXT NOT NULL, department TEXT NOT NULL, min_role TEXT NOT NULL,
+          created_by TEXT NOT NULL, last_synced_at TEXT, last_file_count INTEGER NOT NULL DEFAULT 0,
+          last_chunk_count INTEGER NOT NULL DEFAULT 0, last_status TEXT NOT NULL DEFAULT 'pending', last_error TEXT
+        );
         """)
         conn.execute("""INSERT OR IGNORE INTO users (id,name,role,department,created_at)
                      VALUES ('admin','系统管理员','admin','all',?)""", (now(),))
@@ -177,6 +183,10 @@ class GitHubImportInput(BaseModel):
     max_files: int = Field(default=50, ge=1, le=200)
 
 
+class SourceSyncInput(BaseModel):
+    max_files: int = Field(default=50, ge=1, le=200)
+
+
 def github_repository(repository_url: str) -> tuple[str, str]:
     """解析标准 GitHub HTTPS/SSH 仓库地址。"""
     match = re.fullmatch(r"(?:https://github\.com/|git@github\.com:)([\w.-]+)/([\w.-]+?)(?:\.git)?/?", repository_url.strip())
@@ -196,8 +206,9 @@ def github_headers() -> dict[str, str]:
 def import_github_repository(payload: GitHubImportInput, user: CurrentUser) -> dict[str, object]:
     owner, repository = github_repository(payload.repository_url)
     api_url = f"https://api.github.com/repos/{owner}/{repository}"
+    source_key = f"github.com/{owner}/{repository}"
     try:
-        with httpx.Client(timeout=20, headers=github_headers(), follow_redirects=True) as client:
+        with httpx.Client(timeout=httpx.Timeout(10, connect=5), headers=github_headers(), follow_redirects=True) as client:
             repo_response = client.get(api_url)
             repo_response.raise_for_status()
             default_branch = payload.branch or repo_response.json()["default_branch"]
@@ -207,14 +218,22 @@ def import_github_repository(payload: GitHubImportInput, user: CurrentUser) -> d
             paths = [item["path"] for item in tree if item.get("type") == "blob" and item["path"].lower().endswith((".md", ".txt", ".rst", ".py", ".js", ".ts", ".tsx", ".jsx", ".java", ".go", ".json", ".yml", ".yaml"))][:payload.max_files]
             files: list[tuple[str, str]] = []
             for path in paths:
-                content_response = client.get(f"https://raw.githubusercontent.com/{owner}/{repository}/{default_branch}/{path}")
-                if content_response.is_success and content_response.text.strip():
-                    files.append((path, content_response.text[:100_000]))
+                try:
+                    content_response = client.get(f"https://raw.githubusercontent.com/{owner}/{repository}/{default_branch}/{path}")
+                    if content_response.is_success and content_response.text.strip():
+                        files.append((path, content_response.text[:100_000]))
+                except httpx.HTTPError:
+                    # 单一文件失败不应阻断整个仓库的索引过程。
+                    continue
     except httpx.HTTPStatusError as exc:
+        with db() as conn:
+            conn.execute("""UPDATE knowledge_sources SET last_synced_at=?,last_status='failed',last_error=? WHERE repository=?""", (now(), f"GitHub HTTP {exc.response.status_code}", source_key))
         if exc.response.status_code in {401, 403, 404}:
             raise HTTPException(status.HTTP_502_BAD_GATEWAY, "GitHub 仓库不可访问；私有仓库请在服务端配置 GITHUB_TOKEN") from exc
         raise HTTPException(status.HTTP_502_BAD_GATEWAY, "GitHub API 请求失败") from exc
     except httpx.HTTPError as exc:
+        with db() as conn:
+            conn.execute("""UPDATE knowledge_sources SET last_synced_at=?,last_status='failed',last_error='network error' WHERE repository=?""", (now(), source_key))
         raise HTTPException(status.HTTP_502_BAD_GATEWAY, "连接 GitHub 失败") from exc
 
     source_prefix = f"github:{owner}/{repository}:{default_branch}:"
@@ -232,8 +251,14 @@ def import_github_repository(payload: GitHubImportInput, user: CurrentUser) -> d
             chunks = split_content(content)
             conn.executemany("INSERT INTO chunks VALUES (?,?,?,?,?)", [(str(uuid4()), document_id, position, chunk, " ".join(sorted(normalized_terms(chunk)))) for position, chunk in enumerate(chunks)])
             inserted_chunks += len(chunks)
-        audit(conn, user.id, "github.imported", f"{owner}/{repository}", f"branch={default_branch} files={len(files)} chunks={inserted_chunks}")
-    return {"repository": f"{owner}/{repository}", "branch": default_branch, "files": len(files), "chunks": inserted_chunks, "message": "GitHub 仓库已同步到知识库"}
+        source = conn.execute("SELECT id FROM knowledge_sources WHERE repository=?", (source_key,)).fetchone()
+        source_id = source["id"] if source else str(uuid4())
+        if source:
+            conn.execute("""UPDATE knowledge_sources SET branch=?,department=?,min_role=?,last_synced_at=?,last_file_count=?,last_chunk_count=?,last_status='success',last_error=NULL WHERE id=?""", (default_branch, payload.department, payload.min_role, now(), len(files), inserted_chunks, source_id))
+        else:
+            conn.execute("""INSERT INTO knowledge_sources VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""", (source_id, "github", source_key, default_branch, payload.department, payload.min_role, user.id, now(), len(files), inserted_chunks, "success", None))
+        audit(conn, user.id, "github.imported", source_id, f"repository={source_key} branch={default_branch} files={len(files)} chunks={inserted_chunks}")
+    return {"source_id": source_id, "repository": f"{owner}/{repository}", "branch": default_branch, "files": len(files), "chunks": inserted_chunks, "message": "GitHub 仓库已同步到知识库"}
 
 
 @app.get("/health")
@@ -298,6 +323,49 @@ def import_documents_from_github(payload: GitHubImportInput, user: User) -> dict
     if user.role != "admin" and payload.department not in {"all", user.department}:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "仅可同步到本部门知识库")
     return import_github_repository(payload, user)
+
+
+@app.get("/sources")
+def list_sources(user: User) -> list[dict[str, object]]:
+    with db() as conn:
+        rows = conn.execute("SELECT * FROM knowledge_sources ORDER BY last_synced_at DESC").fetchall()
+    sources = []
+    for row in rows:
+        source = dict(row)
+        if user.role == "admin" or source["department"] in {"all", user.department}:
+            sources.append(source)
+    return sources
+
+
+@app.post("/sources/{source_id}/sync")
+def sync_source(source_id: str, payload: SourceSyncInput, user: User) -> dict[str, object]:
+    with db() as conn:
+        row = conn.execute("SELECT * FROM knowledge_sources WHERE id=?", (source_id,)).fetchone()
+    if not row:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "知识来源不存在")
+    source = dict(row)
+    if user.role == "employee" or (user.role != "admin" and source["department"] not in {"all", user.department}):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "无权同步该知识来源")
+    repository_url = "https://" + source["repository"]
+    return import_github_repository(GitHubImportInput(repository_url=repository_url, branch=source["branch"], department=source["department"], min_role=source["min_role"], max_files=payload.max_files), user)
+
+
+@app.delete("/sources/{source_id}")
+def delete_source(source_id: str, user: User) -> dict[str, str]:
+    with db() as conn:
+        source = conn.execute("SELECT * FROM knowledge_sources WHERE id=?", (source_id,)).fetchone()
+        if not source:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "知识来源不存在")
+        if user.role != "admin" and source["department"] not in {"all", user.department}:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "无权删除该知识来源")
+        prefix = f"github:{source['repository'].removeprefix('github.com/')}:{source['branch']}:"
+        documents = conn.execute("SELECT id FROM documents WHERE title LIKE ?", (prefix + "%",)).fetchall()
+        for document in documents:
+            conn.execute("DELETE FROM chunks WHERE document_id=?", (document["id"],))
+            conn.execute("DELETE FROM documents WHERE id=?", (document["id"],))
+        conn.execute("DELETE FROM knowledge_sources WHERE id=?", (source_id,))
+        audit(conn, user.id, "source.deleted", source_id, source["repository"])
+    return {"message": "知识来源及其索引已删除"}
 
 
 def retrieve(question: str, user: CurrentUser, limit: int = 4) -> list[dict[str, object]]:
