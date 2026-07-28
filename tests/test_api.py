@@ -2,51 +2,65 @@ import os
 from pathlib import Path
 
 os.environ["DATABASE_PATH"] = str(Path(__file__).parent / "test.db")
+os.environ["ERP_AUTH_URL"] = "https://erp.example.test/api/integrations/knowledge-bot/auth"
+os.environ["ERP_INTEGRATION_KEY"] = "test-integration-key"
 
 from fastapi.testclient import TestClient
-from app.main import app
+from app.main import app, db, now, session_hash, timestamp
+
+
+def authenticate(client: TestClient, user_id: str, name: str, role: str, department: str) -> None:
+    token = f"test-{user_id}"
+    with db() as conn:
+        conn.execute("""INSERT INTO users (id,name,role,department,active,created_at) VALUES (?,?,?,?,1,?)
+                     ON CONFLICT(id) DO UPDATE SET name=excluded.name,role=excluded.role,department=excluded.department,active=1""", (user_id, name, role, department, now()))
+        conn.execute("INSERT OR REPLACE INTO auth_sessions VALUES (?,?,?,?)", (session_hash(token), user_id, timestamp() + 3600, now()))
+    client.cookies.set("sm_kb_session", token)
 
 
 def test_rbac_retrieval_and_conversation():
     Path(os.environ["DATABASE_PATH"]).unlink(missing_ok=True)
     with TestClient(app) as client:
-        admin = {"X-User-Id": "admin"}
-        assert client.post("/users", headers=admin, json={"id": "fin-manager", "name": "财务经理", "role": "manager", "department": "finance"}).status_code == 201
-        assert client.post("/users", headers=admin, json={"id": "dev", "name": "研发同事", "role": "employee", "department": "engineering"}).status_code == 201
-        created = client.post("/documents", headers={"X-User-Id": "fin-manager"}, json={"title": "报销制度", "content": "报销单需要在每月十日前提交给财务。", "department": "finance", "min_role": "employee"})
+        authenticate(client, "admin", "系统管理员", "admin", "all")
+        assert client.post("/users", json={"id": "fin-manager", "name": "财务经理", "role": "manager", "department": "finance"}).status_code == 201
+        assert client.post("/users", json={"id": "dev", "name": "研发同事", "role": "employee", "department": "engineering"}).status_code == 201
+        authenticate(client, "fin-manager", "财务经理", "manager", "finance")
+        created = client.post("/documents", json={"title": "报销制度", "content": "报销单需要在每月十日前提交给财务。", "department": "finance", "min_role": "employee"})
         assert created.status_code == 201
-        blocked = client.post("/chat", headers={"X-User-Id": "dev"}, json={"question": "报销何时提交"})
+        authenticate(client, "dev", "研发同事", "employee", "engineering")
+        blocked = client.post("/chat", json={"question": "报销何时提交"})
         assert not blocked.json()["sources"]
-        allowed = client.post("/chat", headers={"X-User-Id": "fin-manager"}, json={"question": "报销何时提交"})
+        authenticate(client, "fin-manager", "财务经理", "manager", "finance")
+        allowed = client.post("/chat", json={"question": "报销何时提交"})
         assert allowed.json()["sources"]
         conversation_id = allowed.json()["conversation_id"]
-        assert client.get(f"/conversations/{conversation_id}", headers={"X-User-Id": "fin-manager"}).status_code == 200
+        assert client.get(f"/conversations/{conversation_id}").status_code == 200
 
 
 def test_sources_are_scoped_to_department():
     Path(os.environ["DATABASE_PATH"]).unlink(missing_ok=True)
     with TestClient(app) as client:
-        admin = {"X-User-Id": "admin"}
-        client.post("/users", headers=admin, json={"id": "eng-manager", "name": "研发经理", "role": "manager", "department": "engineering"})
-        from app.main import db, now
+        authenticate(client, "admin", "系统管理员", "admin", "all")
+        client.post("/users", json={"id": "eng-manager", "name": "研发经理", "role": "manager", "department": "engineering"})
         with db() as conn:
             conn.execute("INSERT INTO knowledge_sources VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", ("source-1", "github", "github.com/acme/engineering", "main", "engineering", "employee", "admin", now(), 1, 2, "success", None))
-        assert len(client.get("/sources", headers=admin).json()) == 1
-        assert len(client.get("/sources", headers={"X-User-Id": "eng-manager"}).json()) == 1
+        assert len(client.get("/sources").json()) == 1
+        authenticate(client, "eng-manager", "研发经理", "manager", "engineering")
+        assert len(client.get("/sources").json()) == 1
 
 
 def test_agents_can_be_created_and_used_with_restricted_scope():
     Path(os.environ["DATABASE_PATH"]).unlink(missing_ok=True)
     with TestClient(app) as client:
-        admin = {"X-User-Id": "admin"}
-        response = client.post("/agents", headers=admin, json={
+        authenticate(client, "admin", "系统管理员", "admin", "all")
+        response = client.post("/agents", json={
             "name": "测试 Agent", "description": "测试受控问答", "department": "all",
             "max_role": "employee", "system_prompt": "只引用授权知识。",
         })
         assert response.status_code == 201
         agent_id = response.json()["id"]
-        assert any(agent["id"] == agent_id for agent in client.get("/agents", headers=admin).json())
-        result = client.post("/chat", headers=admin, json={"question": "研发协作规范", "agent_id": agent_id})
+        assert any(agent["id"] == agent_id for agent in client.get("/agents").json())
+        result = client.post("/chat", json={"question": "研发协作规范", "agent_id": agent_id})
         assert result.status_code == 200
         assert result.json()["agent"]["id"] == agent_id
 
@@ -54,7 +68,4 @@ def test_agents_can_be_created_and_used_with_restricted_scope():
 def test_local_login_returns_active_user():
     Path(os.environ["DATABASE_PATH"]).unlink(missing_ok=True)
     with TestClient(app) as client:
-        login = client.post("/auth/login", json={"username": "admin"})
-        assert login.status_code == 200
-        assert login.json()["user"]["role"] == "admin"
-        assert client.post("/auth/login", json={"username": "unknown"}).status_code == 401
+        assert client.get("/api/summary", headers={"X-User-Id": "admin"}).status_code == 401

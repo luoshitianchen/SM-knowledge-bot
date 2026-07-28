@@ -4,13 +4,15 @@ from __future__ import annotations
 import os
 import re
 import sqlite3
+import secrets
+import hashlib
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated, Literal
 from uuid import uuid4
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, status
+from fastapi import Cookie, Depends, FastAPI, Header, HTTPException, Query, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 import httpx
@@ -20,6 +22,8 @@ DATABASE_PATH = Path(os.getenv("DATABASE_PATH", "data/knowledge_bot.db"))
 DATABASE_PATH.parent.mkdir(parents=True, exist_ok=True)
 ROLE_LEVEL = {"employee": 1, "manager": 2, "admin": 3}
 Role = Literal["employee", "manager", "admin"]
+SESSION_COOKIE = "sm_kb_session"
+SESSION_TTL_SECONDS = int(os.getenv("KB_SESSION_TTL_SECONDS", "28800"))
 
 app = FastAPI(title="SM Knowledge Bot", version="1.2.0", description="企业内部知识库问答服务")
 app.add_middleware(
@@ -83,6 +87,9 @@ def initialize_database() -> None:
           id TEXT PRIMARY KEY, source_id TEXT NOT NULL, started_at TEXT NOT NULL, finished_at TEXT,
           status TEXT NOT NULL, file_count INTEGER NOT NULL DEFAULT 0, chunk_count INTEGER NOT NULL DEFAULT 0, error TEXT
         );
+        CREATE TABLE IF NOT EXISTS auth_sessions (
+          token_hash TEXT PRIMARY KEY, user_id TEXT NOT NULL, expires_at INTEGER NOT NULL, created_at TEXT NOT NULL
+        );
         CREATE TABLE IF NOT EXISTS agents (
           id TEXT PRIMARY KEY, name TEXT NOT NULL, description TEXT NOT NULL,
           department TEXT NOT NULL, max_role TEXT NOT NULL, system_prompt TEXT NOT NULL,
@@ -96,6 +103,7 @@ def initialize_database() -> None:
         CREATE INDEX IF NOT EXISTS idx_audit_logs_created ON audit_logs(created_at DESC);
         CREATE INDEX IF NOT EXISTS idx_source_runs_source_started ON source_sync_runs(source_id, started_at DESC);
         CREATE INDEX IF NOT EXISTS idx_agents_active_department ON agents(active, department);
+        CREATE INDEX IF NOT EXISTS idx_auth_sessions_expiry ON auth_sessions(expires_at);
         """)
         conn.execute("PRAGMA journal_mode = WAL")
         conn.execute("PRAGMA synchronous = NORMAL")
@@ -143,11 +151,21 @@ class CurrentUser(BaseModel):
     department: str
 
 
-def current_user(x_user_id: Annotated[str | None, Header()] = None) -> CurrentUser:
-    if not x_user_id:
-        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "请提供 X-User-Id 请求头")
+def timestamp() -> int:
+    return int(datetime.now(UTC).timestamp())
+
+
+def session_hash(token: str) -> str:
+    return hashlib.sha256(token.encode()).hexdigest()
+
+
+def current_user(session_token: str | None = Cookie(default=None, alias=SESSION_COOKIE)) -> CurrentUser:
+    if not session_token:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "登录会话已失效")
     with db() as conn:
-        row = conn.execute("SELECT * FROM users WHERE id=? AND active=1", (x_user_id,)).fetchone()
+        conn.execute("DELETE FROM auth_sessions WHERE expires_at<?", (timestamp(),))
+        row = conn.execute("""SELECT u.* FROM auth_sessions s JOIN users u ON u.id=s.user_id
+                            WHERE s.token_hash=? AND s.expires_at>? AND u.active=1""", (session_hash(session_token), timestamp())).fetchone()
     if not row:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "用户不存在或已被停用")
     return CurrentUser(**dict(row))
@@ -317,54 +335,47 @@ def health() -> dict[str, str]:
 
 
 @app.post("/auth/login")
-def login(payload: LoginInput) -> dict[str, object]:
-    """本地开发或 ERP REST 认证入口，不保存用户密码。"""
-    auth_mode = os.getenv("AUTH_MODE", "local").lower()
-    if auth_mode == "erp":
-        erp_url = os.getenv("ERP_AUTH_URL")
-        if not erp_url:
-            raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "ERP 登录尚未配置 ERP_AUTH_URL")
-        headers = {"Accept": "application/json"}
-        if api_key := os.getenv("ERP_API_KEY"):
-            headers["X-API-Key"] = api_key
-        try:
-            response = httpx.post(
-                erp_url,
-                headers=headers,
-                json={"username": payload.username, "password": payload.password},
-                timeout=httpx.Timeout(10, connect=5),
-                verify=os.getenv("ERP_VERIFY_TLS", "true").lower() == "true",
-            )
-            response.raise_for_status()
-            profile = response.json()
-        except httpx.HTTPStatusError as exc:
-            raise HTTPException(status.HTTP_401_UNAUTHORIZED, "ERP 账号或密码错误") from exc
-        except (httpx.HTTPError, ValueError) as exc:
-            raise HTTPException(status.HTTP_502_BAD_GATEWAY, "ERP 登录服务暂时不可用") from exc
-        # ERP 响应默认格式：id、name、department、role；可按实际 ERP 配置字段名。
-        try:
-            user_id = str(profile[os.getenv("ERP_USER_ID_FIELD", "id")])
-            name = str(profile[os.getenv("ERP_NAME_FIELD", "name")])
-            department = str(profile[os.getenv("ERP_DEPARTMENT_FIELD", "department")])
-            role = str(profile[os.getenv("ERP_ROLE_FIELD", "role")]).lower()
-        except (KeyError, TypeError) as exc:
-            raise HTTPException(status.HTTP_502_BAD_GATEWAY, "ERP 用户信息缺少 id、name、department 或 role 字段") from exc
-        if role not in ROLE_LEVEL:
-            role = os.getenv("ERP_DEFAULT_ROLE", "employee")
-        with db() as conn:
-            conn.execute("""INSERT INTO users (id,name,role,department,active,created_at) VALUES (?,?,?,?,1,?)
-                         ON CONFLICT(id) DO UPDATE SET name=excluded.name,role=excluded.role,department=excluded.department,active=1""", (user_id, name, role, department, now()))
-            audit(conn, user_id, "erp.login", detail=f"department={department} role={role}")
-    elif auth_mode == "local":
-        user_id = payload.username
-    else:
-        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "AUTH_MODE 必须为 local 或 erp")
+def login(payload: LoginInput, response: Response) -> dict[str, object]:
+    """经 ERP 集成接口认证后签发本项目专用 HttpOnly 会话。"""
+    erp_url = os.getenv("ERP_AUTH_URL")
+    integration_key = os.getenv("ERP_INTEGRATION_KEY")
+    if not erp_url or not integration_key:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "ERP 集成认证尚未配置")
+    try:
+        erp_response = httpx.post(
+            erp_url,
+            headers={"Accept": "application/json", "X-Integration-Key": integration_key},
+            json={"username": payload.username, "password": payload.password},
+            timeout=httpx.Timeout(10, connect=5),
+            verify=os.getenv("ERP_VERIFY_TLS", "true").lower() == "true",
+        )
+        erp_response.raise_for_status()
+        profile = erp_response.json()
+        user_id, name = str(profile["id"]), str(profile["name"])
+        department, role = str(profile["department"]), str(profile["role"]).lower()
+    except httpx.HTTPStatusError as exc:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "ERP 账号或密码错误") from exc
+    except (httpx.HTTPError, KeyError, TypeError, ValueError) as exc:
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, "ERP 身份服务暂时不可用") from exc
+    if role not in ROLE_LEVEL:
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, "ERP 返回了不受支持的角色")
+    token = secrets.token_urlsafe(48)
     with db() as conn:
-        row = conn.execute("SELECT * FROM users WHERE id=? AND active=1", (user_id,)).fetchone()
-    if not row:
-        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "账号不存在或已停用")
-    user = CurrentUser(**dict(row))
-    return {"message": "登录成功", "user": user.model_dump()}
+        conn.execute("""INSERT INTO users (id,name,role,department,active,created_at) VALUES (?,?,?,?,1,?)
+                     ON CONFLICT(id) DO UPDATE SET name=excluded.name,role=excluded.role,department=excluded.department,active=1""", (user_id, name, role, department, now()))
+        conn.execute("INSERT INTO auth_sessions VALUES (?,?,?,?)", (session_hash(token), user_id, timestamp() + SESSION_TTL_SECONDS, now()))
+        audit(conn, user_id, "erp.login", detail=f"department={department} role={role}")
+    response.set_cookie(SESSION_COOKIE, token, max_age=SESSION_TTL_SECONDS, httponly=True, secure=os.getenv("KB_ENV", "development") == "production", samesite="strict", path="/")
+    return {"message": "登录成功", "user": CurrentUser(id=user_id, name=name, role=role, department=department).model_dump()}
+
+
+@app.post("/auth/logout")
+def logout(response: Response, session_token: str | None = Cookie(default=None, alias=SESSION_COOKIE)) -> dict[str, str]:
+    if session_token:
+        with db() as conn:
+            conn.execute("DELETE FROM auth_sessions WHERE token_hash=?", (session_hash(session_token),))
+    response.delete_cookie(SESSION_COOKIE, path="/")
+    return {"message": "已退出登录"}
 
 
 @app.get("/api/summary")

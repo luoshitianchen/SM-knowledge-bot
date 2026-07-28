@@ -23,19 +23,18 @@ pip install -r requirements.txt
 uvicorn app.main:app --reload
 ```
 
-访问 http://127.0.0.1:8000/docs 使用 Swagger 文档。首次启动自动创建管理员 `admin`；本地开发通过请求头 `X-User-Id: admin` 调用管理员接口。
+访问 http://127.0.0.1:8000/docs 使用 Swagger 文档。Python 服务通过 ERP 集成认证建立 `HttpOnly` 会话 Cookie；业务接口不接受客户端传入的用户 ID。
 
 ## ERP 登录联动
 
-开发环境默认使用 `AUTH_MODE=local`，登录页可用账号 `admin`。企业部署时在 `.env` 配置：
+企业部署时在 `.env` 配置 ERP 集成认证端点和共享集成密钥：
 
 ```text
-AUTH_MODE=erp
-ERP_AUTH_URL=https://ERP_HOST/api/auth/login
-ERP_API_KEY=ERP_SERVICE_KEY
+ERP_AUTH_URL=https://ERP_HOST/api/integrations/knowledge-bot/auth
+ERP_INTEGRATION_KEY=RANDOM_SHARED_INTEGRATION_KEY
 ```
 
-系统会以 `username` 和 `password` 调用 ERP 认证接口，不保存密码。ERP 接口需返回用户字段 `id`、`name`、`department`、`role`；若字段名不同，可通过 `ERP_*_FIELD` 环境变量映射。支持的角色为 `employee`、`manager`、`admin`。
+系统会以 `username` 和 `password` 调用 ERP 受保护集成接口，不保存密码。ERP 返回 `id`、`name`、`department`、`role` 后，知识库签发独立的 `HttpOnly`、`SameSite=Strict` 会话 Cookie。支持的角色为 `employee`、`manager`、`admin`。
 
 ### 一键启动与浏览器演示
 
@@ -60,7 +59,7 @@ Copy-Item .env.example .env
 
 1. 用 `POST /users` 创建用户（管理员）。
 2. 用 `POST /documents` 录入文档（经理/管理员）。
-3. 用 `POST /chat` 提问；带上实际用户的 `X-User-Id`。
+3. 登录成功后，用 `POST /chat` 提问；浏览器自动携带会话 Cookie。
 4. 将返回的 `conversation_id` 传回 `/chat` 保持多轮会话。
 
 ## 从 GitHub 导入知识
@@ -68,7 +67,7 @@ Copy-Item .env.example .env
 经理或管理员调用 `POST /documents/import/github` 即可直接拉取 GitHub 仓库内容。系统会读取默认分支（或指定 `branch`）中的 `.md`、`.txt`、`.rst`、`.py`、`.js`、`.ts`、`.json`、`.yml` 等文件；重复同步同一仓库分支会自动替换旧索引。
 
 ```powershell
-Invoke-RestMethod http://127.0.0.1:8000/documents/import/github -Method Post -Headers @{ 'X-User-Id' = 'admin' } -ContentType 'application/json' -Body '{"repository_url":"https://github.com/luoshitianchen/SM-knowledge-bot","department":"engineering","min_role":"employee"}'
+Invoke-RestMethod http://127.0.0.1:8000/documents/import/github -Method Post -WebSession $session -ContentType 'application/json' -Body '{"repository_url":"https://github.com/luoshitianchen/SM-knowledge-bot","department":"engineering","min_role":"employee"}'
 ```
 
 私有仓库请在服务端环境变量中设置访问 Token：
@@ -83,12 +82,9 @@ py -3.11 -m uvicorn app.main:app --reload
 每次成功同步都会写入来源同步历史（时间、状态、文件数和知识块数），可在控制台点击“同步历史”查看。
 
 ```powershell
-$admin = @{ 'X-User-Id' = 'admin' }
-Invoke-RestMethod http://127.0.0.1:8000/users -Method Post -Headers $admin -ContentType 'application/json' -Body '{"id":"finance-manager","name":"财务经理","role":"manager","department":"finance"}'
-
-Invoke-RestMethod http://127.0.0.1:8000/documents -Method Post -Headers @{ 'X-User-Id' = 'finance-manager' } -ContentType 'application/json' -Body '{"title":"报销制度","content":"员工须于每月十日前提交报销单。","department":"finance"}'
-
-Invoke-RestMethod http://127.0.0.1:8000/chat -Method Post -Headers @{ 'X-User-Id' = 'finance-manager' } -ContentType 'application/json' -Body '{"question":"报销单何时提交？"}'
+$session = New-Object Microsoft.PowerShell.Commands.WebRequestSession
+Invoke-RestMethod http://127.0.0.1:8000/auth/login -Method Post -WebSession $session -ContentType 'application/json' -Body '{"username":"ERP账号","password":"ERP密码"}'
+Invoke-RestMethod http://127.0.0.1:8000/chat -Method Post -WebSession $session -ContentType 'application/json' -Body '{"question":"报销单何时提交？"}'
 ```
 
 ## Docker
@@ -99,7 +95,7 @@ docker compose up --build
 
 ## Java（Spring Boot）运行版本
 
-仓库同时提供独立的 Java 21 + Spring Boot 版本，位于 `java` 目录；功能包括 GitHub 导入、RBAC、SQLite 持久化与知识问答 API。
+`java` 目录保留为历史演示实现，不包含当前 ERP 集成会话与安全加固能力。生产环境必须部署根目录 Python 服务，并通过 `SM-ERP` 的集成认证接口登录。
 
 ```powershell
 cd C:\Users\Admin\Desktop\github项目\SM-knowledge-bot
