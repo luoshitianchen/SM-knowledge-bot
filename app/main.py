@@ -24,6 +24,9 @@ ROLE_LEVEL = {"employee": 1, "manager": 2, "admin": 3}
 Role = Literal["employee", "manager", "admin"]
 SESSION_COOKIE = "sm_kb_session"
 SESSION_TTL_SECONDS = int(os.getenv("KB_SESSION_TTL_SECONDS", "28800"))
+LOGIN_RATE_WINDOW_SECONDS = int(os.getenv("KB_LOGIN_RATE_WINDOW_SECONDS", "60"))
+LOGIN_RATE_MAX_REQUESTS = int(os.getenv("KB_LOGIN_RATE_MAX_REQUESTS", "20"))
+login_rate_window: dict[str, tuple[int, int]] = {}
 
 app = FastAPI(title="SM Knowledge Bot", version="1.2.0", description="企业内部知识库问答服务")
 app.add_middleware(
@@ -129,6 +132,9 @@ def seed_demo_data() -> None:
 
 @app.on_event("startup")
 def startup() -> None:
+    if os.getenv("KB_ENV", "development") == "production":
+        if not os.getenv("ERP_AUTH_URL") or not os.getenv("ERP_INTEGRATION_KEY") or os.getenv("ERP_INTEGRATION_KEY", "").startswith("REPLACE_"):
+            raise RuntimeError("生产环境必须配置 ERP_AUTH_URL 和 ERP_INTEGRATION_KEY")
     initialize_database()
     if os.getenv("SEED_DEMO_DATA", "true").lower() == "true":
         seed_demo_data()
@@ -141,6 +147,11 @@ async def add_request_timing(request: Request, call_next):
     response = await call_next(request)
     elapsed_ms = (datetime.now(UTC) - started).total_seconds() * 1000
     response.headers["X-Process-Time-Ms"] = f"{elapsed_ms:.2f}"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+    response.headers["Content-Security-Policy"] = "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; base-uri 'self'; frame-ancestors 'none'"
     return response
 
 
@@ -335,12 +346,19 @@ def health() -> dict[str, str]:
 
 
 @app.post("/auth/login")
-def login(payload: LoginInput, response: Response) -> dict[str, object]:
+def login(payload: LoginInput, response: Response, request: Request) -> dict[str, object]:
     """经 ERP 集成接口认证后签发本项目专用 HttpOnly 会话。"""
     erp_url = os.getenv("ERP_AUTH_URL")
     integration_key = os.getenv("ERP_INTEGRATION_KEY")
     if not erp_url or not integration_key:
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "ERP 集成认证尚未配置")
+    client_ip = request.client.host if request.client else "unknown"
+    window_started, count = login_rate_window.get(client_ip, (timestamp(), 0))
+    if timestamp() - window_started >= LOGIN_RATE_WINDOW_SECONDS:
+        window_started, count = timestamp(), 0
+    if count >= LOGIN_RATE_MAX_REQUESTS:
+        raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "登录请求过于频繁，请稍后重试")
+    login_rate_window[client_ip] = (window_started, count + 1)
     try:
         erp_response = httpx.post(
             erp_url,

@@ -55,6 +55,8 @@ Copy-Item .env.example .env
 
 部署完成后访问 http://127.0.0.1:8010/。容器包含健康检查，SQLite 数据保存在本机 `data/` 目录；若端口冲突，可在 `.env` 修改 `APP_PORT`。私有 GitHub 仓库在 `.env` 中设置 `GITHUB_TOKEN` 后再执行部署。
 
+生产部署使用 `KB_ENV=production`。应用会校验 ERP 集成端点和集成密钥，容器以非 root 用户运行，且所有响应附带基础安全响应头与登录速率限制。生产环境应在反向代理层启用 HTTPS、IP 限流、访问日志与集中式监控。
+
 ## 快速流程
 
 1. 用 `POST /users` 创建用户（管理员）。
