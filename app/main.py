@@ -108,6 +108,9 @@ def initialize_database() -> None:
         CREATE INDEX IF NOT EXISTS idx_agents_active_department ON agents(active, department);
         CREATE INDEX IF NOT EXISTS idx_auth_sessions_expiry ON auth_sessions(expires_at);
         """)
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(auth_sessions)").fetchall()}
+        if "csrf_hash" not in columns:
+            conn.execute("ALTER TABLE auth_sessions ADD COLUMN csrf_hash TEXT")
         conn.execute("PRAGMA journal_mode = WAL")
         conn.execute("PRAGMA synchronous = NORMAL")
         conn.execute("""INSERT OR IGNORE INTO users (id,name,role,department,created_at)
@@ -143,6 +146,14 @@ def startup() -> None:
 @app.middleware("http")
 async def add_request_timing(request: Request, call_next):
     """为控制台和监控提供轻量级请求耗时指标。"""
+    if request.method in {"POST", "PATCH", "PUT", "DELETE"} and request.url.path != "/auth/login":
+        token, csrf_token = request.cookies.get(SESSION_COOKIE), request.headers.get("X-CSRF-Token")
+        if not token or not csrf_token:
+            return Response(status_code=status.HTTP_403_FORBIDDEN, content="CSRF validation failed")
+        with db() as conn:
+            row = conn.execute("SELECT csrf_hash,expires_at FROM auth_sessions WHERE token_hash=?", (session_hash(token),)).fetchone()
+        if not row or row["expires_at"] <= timestamp() or not secrets.compare_digest(row["csrf_hash"] or "", session_hash(csrf_token)):
+            return Response(status_code=status.HTTP_403_FORBIDDEN, content="CSRF validation failed")
     started = datetime.now(UTC)
     response = await call_next(request)
     elapsed_ms = (datetime.now(UTC) - started).total_seconds() * 1000
@@ -152,6 +163,9 @@ async def add_request_timing(request: Request, call_next):
     response.headers["Referrer-Policy"] = "no-referrer"
     response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
     response.headers["Content-Security-Policy"] = "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; base-uri 'self'; frame-ancestors 'none'"
+    response.headers["Cache-Control"] = "no-store" if request.url.path.startswith(("/api/", "/auth/", "/sources", "/agents", "/chat")) else "no-cache"
+    if os.getenv("KB_ENV", "development") == "production":
+        response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
     return response
 
 
@@ -377,14 +391,14 @@ def login(payload: LoginInput, response: Response, request: Request) -> dict[str
         raise HTTPException(status.HTTP_502_BAD_GATEWAY, "ERP 身份服务暂时不可用") from exc
     if role not in ROLE_LEVEL:
         raise HTTPException(status.HTTP_502_BAD_GATEWAY, "ERP 返回了不受支持的角色")
-    token = secrets.token_urlsafe(48)
+    token, csrf_token = secrets.token_urlsafe(48), secrets.token_urlsafe(32)
     with db() as conn:
         conn.execute("""INSERT INTO users (id,name,role,department,active,created_at) VALUES (?,?,?,?,1,?)
                      ON CONFLICT(id) DO UPDATE SET name=excluded.name,role=excluded.role,department=excluded.department,active=1""", (user_id, name, role, department, now()))
-        conn.execute("INSERT INTO auth_sessions VALUES (?,?,?,?)", (session_hash(token), user_id, timestamp() + SESSION_TTL_SECONDS, now()))
+        conn.execute("INSERT INTO auth_sessions (token_hash,user_id,expires_at,created_at,csrf_hash) VALUES (?,?,?,?,?)", (session_hash(token), user_id, timestamp() + SESSION_TTL_SECONDS, now(), session_hash(csrf_token)))
         audit(conn, user_id, "erp.login", detail=f"department={department} role={role}")
     response.set_cookie(SESSION_COOKIE, token, max_age=SESSION_TTL_SECONDS, httponly=True, secure=os.getenv("KB_ENV", "development") == "production", samesite="strict", path="/")
-    return {"message": "登录成功", "user": CurrentUser(id=user_id, name=name, role=role, department=department).model_dump()}
+    return {"message": "登录成功", "user": CurrentUser(id=user_id, name=name, role=role, department=department).model_dump(), "csrf_token": csrf_token}
 
 
 @app.post("/auth/logout")

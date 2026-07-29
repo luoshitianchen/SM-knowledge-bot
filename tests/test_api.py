@@ -11,11 +11,13 @@ from app.main import app, db, now, session_hash, timestamp
 
 def authenticate(client: TestClient, user_id: str, name: str, role: str, department: str) -> None:
     token = f"test-{user_id}"
+    csrf = f"csrf-{user_id}"
     with db() as conn:
         conn.execute("""INSERT INTO users (id,name,role,department,active,created_at) VALUES (?,?,?,?,1,?)
                      ON CONFLICT(id) DO UPDATE SET name=excluded.name,role=excluded.role,department=excluded.department,active=1""", (user_id, name, role, department, now()))
-        conn.execute("INSERT OR REPLACE INTO auth_sessions VALUES (?,?,?,?)", (session_hash(token), user_id, timestamp() + 3600, now()))
+        conn.execute("INSERT OR REPLACE INTO auth_sessions (token_hash,user_id,expires_at,created_at,csrf_hash) VALUES (?,?,?,?,?)", (session_hash(token), user_id, timestamp() + 3600, now(), session_hash(csrf)))
     client.cookies.set("sm_kb_session", token)
+    client.headers.update({"X-CSRF-Token": csrf})
 
 
 def test_rbac_retrieval_and_conversation():
@@ -69,3 +71,6 @@ def test_local_login_returns_active_user():
     Path(os.environ["DATABASE_PATH"]).unlink(missing_ok=True)
     with TestClient(app) as client:
         assert client.get("/api/summary", headers={"X-User-Id": "admin"}).status_code == 401
+        authenticate(client, "admin", "系统管理员", "admin", "all")
+        client.headers.pop("X-CSRF-Token")
+        assert client.post("/agents", json={"name": "被拒绝", "description": "缺少 CSRF", "department": "all", "max_role": "employee", "system_prompt": "test"}).status_code == 403
