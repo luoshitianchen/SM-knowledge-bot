@@ -93,6 +93,19 @@ def test_rejects_oversized_request_body(monkeypatch):
         assert response.headers["X-Request-Id"]
 
 
+def test_rejects_malformed_content_length():
+    with TestClient(app) as client:
+        response = client.get("/health", headers={"Content-Length": "not-a-number"})
+        assert response.status_code == 400
+
+
+def test_replaces_unsafe_request_id():
+    with TestClient(app) as client:
+        response = client.get("/health", headers={"X-Request-Id": "x" * 65})
+        assert response.status_code == 200
+        assert response.headers["X-Request-Id"] != "x" * 65
+
+
 def test_production_refuses_demo_data(monkeypatch):
     from app import main
     monkeypatch.setenv("KB_ENV", "production")
