@@ -30,6 +30,7 @@ SESSION_COOKIE = "sm_kb_session"
 SESSION_TTL_SECONDS = int(os.getenv("KB_SESSION_TTL_SECONDS", "28800"))
 LOGIN_RATE_WINDOW_SECONDS = int(os.getenv("KB_LOGIN_RATE_WINDOW_SECONDS", "60"))
 LOGIN_RATE_MAX_REQUESTS = int(os.getenv("KB_LOGIN_RATE_MAX_REQUESTS", "20"))
+MAX_REQUEST_BYTES = int(os.getenv("KB_MAX_REQUEST_BYTES", "1048576"))
 login_rate_window: dict[str, tuple[int, int]] = {}
 request_id_context: ContextVar[str] = ContextVar("request_id", default="system")
 
@@ -150,6 +151,8 @@ def startup() -> None:
             raise RuntimeError("生产环境必须配置 ERP_AUTH_URL 和 ERP_INTEGRATION_KEY")
         if any(host in {"*", "0.0.0.0"} for host in allowed_hosts):
             raise RuntimeError("生产环境 KB_ALLOWED_HOSTS 不可包含通配主机")
+        if os.getenv("SEED_DEMO_DATA", "false").lower() == "true":
+            raise RuntimeError("生产环境禁止启用 SEED_DEMO_DATA")
     initialize_database()
     if os.getenv("SEED_DEMO_DATA", "true").lower() == "true":
         seed_demo_data()
@@ -161,6 +164,10 @@ async def add_request_timing(request: Request, call_next):
     request_id = request.headers.get("X-Request-Id") or str(uuid4())
     request.state.request_id = request_id
     context_token = request_id_context.set(request_id)
+    content_length = request.headers.get("content-length")
+    if content_length and int(content_length) > MAX_REQUEST_BYTES:
+        request_id_context.reset(context_token)
+        return Response(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, content="Request body too large", headers={"X-Request-Id": request_id})
     if request.method in {"POST", "PATCH", "PUT", "DELETE"} and request.url.path != "/auth/login":
         token, csrf_token = request.cookies.get(SESSION_COOKIE), request.headers.get("X-CSRF-Token")
         if not token or not csrf_token:
@@ -403,6 +410,10 @@ def login(payload: LoginInput, response: Response, request: Request) -> dict[str
     if not erp_url or not integration_key:
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "ERP 集成认证尚未配置")
     client_ip = request.client.host if request.client else "unknown"
+    current_time = timestamp()
+    for ip, (started, _) in list(login_rate_window.items()):
+        if current_time - started >= LOGIN_RATE_WINDOW_SECONDS:
+            login_rate_window.pop(ip, None)
     window_started, count = login_rate_window.get(client_ip, (timestamp(), 0))
     if timestamp() - window_started >= LOGIN_RATE_WINDOW_SECONDS:
         window_started, count = timestamp(), 0

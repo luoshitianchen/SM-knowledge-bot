@@ -82,3 +82,25 @@ def test_security_headers_and_request_id():
         assert response.status_code == 200
         assert response.headers["X-Request-Id"] == "kb-trace-1"
         assert response.headers["X-Content-Type-Options"] == "nosniff"
+
+
+def test_rejects_oversized_request_body(monkeypatch):
+    from app import main
+    monkeypatch.setattr(main, "MAX_REQUEST_BYTES", 8)
+    with TestClient(app) as client:
+        response = client.post("/auth/login", content="x" * 9, headers={"content-type": "application/json"})
+        assert response.status_code == 413
+        assert response.headers["X-Request-Id"]
+
+
+def test_production_refuses_demo_data(monkeypatch):
+    from app import main
+    monkeypatch.setenv("KB_ENV", "production")
+    monkeypatch.setenv("SEED_DEMO_DATA", "true")
+    monkeypatch.setattr(main, "allowed_hosts", ["kb.internal.test"])
+    try:
+        main.startup()
+    except RuntimeError as exc:
+        assert "SEED_DEMO_DATA" in str(exc)
+    else:
+        raise AssertionError("production demo data must be refused")
