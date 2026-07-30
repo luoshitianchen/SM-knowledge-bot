@@ -13,7 +13,7 @@ permissions:
 
 jobs:
   codeql:
-    uses: github/codeql-action/.github/workflows/codeql.yml@v3
+    uses: github/codeql-action/.github/workflows/codeql.yml@v4
     with:
       languages: python
   dependency-audit:
