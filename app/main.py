@@ -17,6 +17,7 @@ from uuid import uuid4
 
 from fastapi import Cookie, Depends, FastAPI, Header, HTTPException, Query, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import FileResponse
 import httpx
 from pydantic import BaseModel, Field
@@ -32,7 +33,10 @@ LOGIN_RATE_MAX_REQUESTS = int(os.getenv("KB_LOGIN_RATE_MAX_REQUESTS", "20"))
 login_rate_window: dict[str, tuple[int, int]] = {}
 request_id_context: ContextVar[str] = ContextVar("request_id", default="system")
 
-app = FastAPI(title="SM Knowledge Bot", version="1.2.0", description="企业内部知识库问答服务")
+docs_enabled = os.getenv("KB_ENABLE_DOCS", "false").lower() == "true"
+app = FastAPI(title="SM Knowledge Bot", version="1.2.0", description="企业内部知识库问答服务", docs_url="/docs" if docs_enabled else None, redoc_url=None, openapi_url="/openapi.json" if docs_enabled else None)
+allowed_hosts = [host.strip() for host in os.getenv("KB_ALLOWED_HOSTS", "localhost,127.0.0.1,testserver").split(",") if host.strip()]
+app.add_middleware(TrustedHostMiddleware, allowed_hosts=allowed_hosts)
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(message)s")
 logger = logging.getLogger("sm_knowledge_bot")
 app.add_middleware(
@@ -144,6 +148,8 @@ def startup() -> None:
     if os.getenv("KB_ENV", "development") == "production":
         if not os.getenv("ERP_AUTH_URL") or not os.getenv("ERP_INTEGRATION_KEY") or os.getenv("ERP_INTEGRATION_KEY", "").startswith("REPLACE_"):
             raise RuntimeError("生产环境必须配置 ERP_AUTH_URL 和 ERP_INTEGRATION_KEY")
+        if any(host in {"*", "0.0.0.0"} for host in allowed_hosts):
+            raise RuntimeError("生产环境 KB_ALLOWED_HOSTS 不可包含通配主机")
     initialize_database()
     if os.getenv("SEED_DEMO_DATA", "true").lower() == "true":
         seed_demo_data()

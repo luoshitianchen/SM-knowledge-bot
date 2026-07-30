@@ -57,6 +57,10 @@ Copy-Item .env.example .env
 
 生产部署使用 `KB_ENV=production`。应用会校验 ERP 集成端点和集成密钥，容器以非 root 用户运行，且所有响应附带基础安全响应头与登录速率限制。生产环境应在反向代理层启用 HTTPS、IP 限流、访问日志与集中式监控。
 
+## 网络暴露控制
+
+Docker 默认仅监听 `127.0.0.1:8010`，不直接暴露到公网。应通过企业 VPN、零信任网关或反向代理提供访问，并配置 TLS、IP 白名单和身份认证。生产环境保持 `KB_ENABLE_DOCS=false`，把实际内部域名写入 `KB_ALLOWED_HOSTS`。
+
 ## 快速流程
 
 1. 用 `POST /users` 创建用户（管理员）。
