@@ -6,6 +6,8 @@ import re
 import sqlite3
 import secrets
 import hashlib
+import json
+import logging
 from contextvars import ContextVar
 from contextlib import contextmanager
 from datetime import UTC, datetime
@@ -31,6 +33,8 @@ login_rate_window: dict[str, tuple[int, int]] = {}
 request_id_context: ContextVar[str] = ContextVar("request_id", default="system")
 
 app = FastAPI(title="SM Knowledge Bot", version="1.2.0", description="企业内部知识库问答服务")
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(message)s")
+logger = logging.getLogger("sm_knowledge_bot")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=os.getenv("CORS_ORIGINS", "http://localhost:3000").split(","),
@@ -167,6 +171,7 @@ async def add_request_timing(request: Request, call_next):
     elapsed_ms = (datetime.now(UTC) - started).total_seconds() * 1000
     response.headers["X-Process-Time-Ms"] = f"{elapsed_ms:.2f}"
     response.headers["X-Request-Id"] = request_id
+    logger.info(json.dumps({"request_id": request_id, "method": request.method, "path": request.url.path, "status": response.status_code, "duration_ms": round(elapsed_ms, 2)}, ensure_ascii=False))
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["Referrer-Policy"] = "no-referrer"
@@ -372,6 +377,16 @@ def health() -> dict[str, str]:
     except sqlite3.Error as exc:
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "数据库不可用") from exc
     return {"status": "ok", "version": app.version, "database": "ok"}
+
+
+@app.get("/readyz")
+def ready() -> dict[str, str]:
+    """编排平台就绪探针：确认数据库与 ERP 集成配置有效。"""
+    with db() as conn:
+        conn.execute("SELECT 1").fetchone()
+    if os.getenv("KB_ENV", "development") == "production" and (not os.getenv("ERP_AUTH_URL") or not os.getenv("ERP_INTEGRATION_KEY")):
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "ERP 集成配置不可用")
+    return {"status": "ready"}
 
 
 @app.post("/auth/login")
