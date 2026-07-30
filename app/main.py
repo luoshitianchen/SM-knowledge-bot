@@ -6,6 +6,7 @@ import re
 import sqlite3
 import secrets
 import hashlib
+from contextvars import ContextVar
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
@@ -27,6 +28,7 @@ SESSION_TTL_SECONDS = int(os.getenv("KB_SESSION_TTL_SECONDS", "28800"))
 LOGIN_RATE_WINDOW_SECONDS = int(os.getenv("KB_LOGIN_RATE_WINDOW_SECONDS", "60"))
 LOGIN_RATE_MAX_REQUESTS = int(os.getenv("KB_LOGIN_RATE_MAX_REQUESTS", "20"))
 login_rate_window: dict[str, tuple[int, int]] = {}
+request_id_context: ContextVar[str] = ContextVar("request_id", default="system")
 
 app = FastAPI(title="SM Knowledge Bot", version="1.2.0", description="企业内部知识库问答服务")
 app.add_middleware(
@@ -146,18 +148,25 @@ def startup() -> None:
 @app.middleware("http")
 async def add_request_timing(request: Request, call_next):
     """为控制台和监控提供轻量级请求耗时指标。"""
+    request_id = request.headers.get("X-Request-Id") or str(uuid4())
+    request.state.request_id = request_id
+    context_token = request_id_context.set(request_id)
     if request.method in {"POST", "PATCH", "PUT", "DELETE"} and request.url.path != "/auth/login":
         token, csrf_token = request.cookies.get(SESSION_COOKIE), request.headers.get("X-CSRF-Token")
         if not token or not csrf_token:
-            return Response(status_code=status.HTTP_403_FORBIDDEN, content="CSRF validation failed")
+            request_id_context.reset(context_token)
+            return Response(status_code=status.HTTP_403_FORBIDDEN, content="CSRF validation failed", headers={"X-Request-Id": request_id})
         with db() as conn:
             row = conn.execute("SELECT csrf_hash,expires_at FROM auth_sessions WHERE token_hash=?", (session_hash(token),)).fetchone()
         if not row or row["expires_at"] <= timestamp() or not secrets.compare_digest(row["csrf_hash"] or "", session_hash(csrf_token)):
-            return Response(status_code=status.HTTP_403_FORBIDDEN, content="CSRF validation failed")
+            request_id_context.reset(context_token)
+            return Response(status_code=status.HTTP_403_FORBIDDEN, content="CSRF validation failed", headers={"X-Request-Id": request_id})
     started = datetime.now(UTC)
     response = await call_next(request)
+    request_id_context.reset(context_token)
     elapsed_ms = (datetime.now(UTC) - started).total_seconds() * 1000
     response.headers["X-Process-Time-Ms"] = f"{elapsed_ms:.2f}"
+    response.headers["X-Request-Id"] = request_id
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["Referrer-Policy"] = "no-referrer"
@@ -206,7 +215,8 @@ def require_admin(user: User) -> CurrentUser:
 
 
 def audit(conn: sqlite3.Connection, user_id: str, action: str, resource_id: str | None = None, detail: str = "") -> None:
-    conn.execute("INSERT INTO audit_logs VALUES (?,?,?,?,?,?)", (str(uuid4()), user_id, action, resource_id, detail, now()))
+    enriched = f"request_id={request_id_context.get()} {detail}".strip()
+    conn.execute("INSERT INTO audit_logs VALUES (?,?,?,?,?,?)", (str(uuid4()), user_id, action, resource_id, enriched, now()))
 
 
 def normalized_terms(text: str) -> set[str]:
@@ -356,7 +366,12 @@ def import_github_repository(payload: GitHubImportInput, user: CurrentUser) -> d
 
 @app.get("/health")
 def health() -> dict[str, str]:
-    return {"status": "ok", "version": app.version}
+    try:
+        with db() as conn:
+            conn.execute("SELECT 1").fetchone()
+    except sqlite3.Error as exc:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "数据库不可用") from exc
+    return {"status": "ok", "version": app.version, "database": "ok"}
 
 
 @app.post("/auth/login")

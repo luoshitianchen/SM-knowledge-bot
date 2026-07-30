@@ -74,3 +74,11 @@ def test_local_login_returns_active_user():
         authenticate(client, "admin", "系统管理员", "admin", "all")
         client.headers.pop("X-CSRF-Token")
         assert client.post("/agents", json={"name": "被拒绝", "description": "缺少 CSRF", "department": "all", "max_role": "employee", "system_prompt": "test"}).status_code == 403
+
+
+def test_security_headers_and_request_id():
+    with TestClient(app) as client:
+        response = client.get("/health", headers={"X-Request-Id": "kb-trace-1"})
+        assert response.status_code == 200
+        assert response.headers["X-Request-Id"] == "kb-trace-1"
+        assert response.headers["X-Content-Type-Options"] == "nosniff"
