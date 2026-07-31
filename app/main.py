@@ -718,8 +718,28 @@ def get_conversation(conversation_id: str, user: User) -> dict[str, object]:
 
 
 @app.get("/audit-logs")
-def list_audit_logs(user: User, limit: int = Query(50, ge=1, le=200)) -> list[dict[str, str]]:
+def list_audit_logs(
+    user: User,
+    limit: int = Query(50, ge=1, le=100),
+    offset: int = Query(0, ge=0, le=10_000),
+    action: str | None = Query(default=None, min_length=1, max_length=100),
+    since: str | None = Query(default=None, max_length=40),
+) -> dict[str, object]:
+    """管理员审计查询：分页与受限筛选避免全表读取。"""
     require_admin(user)
+    clauses, params = [], []
+    if action:
+        clauses.append("action=?")
+        params.append(action)
+    if since:
+        try:
+            datetime.fromisoformat(since.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "since 必须是 ISO 8601 时间") from exc
+        clauses.append("created_at>=?")
+        params.append(since)
+    where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
     with db() as conn:
-        rows = conn.execute("SELECT * FROM audit_logs ORDER BY created_at DESC LIMIT ?", (limit,)).fetchall()
-    return [dict(row) for row in rows]
+        total = conn.execute(f"SELECT COUNT(*) FROM audit_logs{where}", params).fetchone()[0]
+        rows = conn.execute(f"SELECT * FROM audit_logs{where} ORDER BY created_at DESC LIMIT ? OFFSET ?", [*params, limit, offset]).fetchall()
+    return {"items": [dict(row) for row in rows], "total": total, "limit": limit, "offset": offset}

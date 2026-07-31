@@ -142,3 +142,16 @@ def test_github_import_is_serialized():
             assert response.status_code == 429
     finally:
         main.github_import_lock.release()
+
+
+def test_admin_audit_logs_are_paginated_and_filterable():
+    Path(os.environ["DATABASE_PATH"]).unlink(missing_ok=True)
+    with TestClient(app) as client:
+        authenticate(client, "admin", "系统管理员", "admin", "all")
+        assert client.post("/users", json={"id": "audit-user", "name": "审计用户", "role": "employee", "department": "engineering"}).status_code == 201
+        response = client.get("/audit-logs?action=user.created&limit=1&offset=0")
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["total"] >= 1
+        assert len(payload["items"]) == 1
+        assert payload["items"][0]["action"] == "user.created"
