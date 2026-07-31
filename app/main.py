@@ -8,6 +8,8 @@ import secrets
 import hashlib
 import json
 import logging
+import threading
+import time
 from contextvars import ContextVar
 from contextlib import asynccontextmanager, contextmanager
 from datetime import UTC, datetime
@@ -31,7 +33,12 @@ SESSION_TTL_SECONDS = int(os.getenv("KB_SESSION_TTL_SECONDS", "28800"))
 LOGIN_RATE_WINDOW_SECONDS = int(os.getenv("KB_LOGIN_RATE_WINDOW_SECONDS", "60"))
 LOGIN_RATE_MAX_REQUESTS = int(os.getenv("KB_LOGIN_RATE_MAX_REQUESTS", "20"))
 MAX_REQUEST_BYTES = int(os.getenv("KB_MAX_REQUEST_BYTES", "1048576"))
+SQLITE_WRITE_RETRIES = int(os.getenv("KB_SQLITE_WRITE_RETRIES", "4"))
+GITHUB_MAX_TOTAL_BYTES = int(os.getenv("KB_GITHUB_MAX_TOTAL_BYTES", "2000000"))
+GITHUB_MAX_FILE_BYTES = int(os.getenv("KB_GITHUB_MAX_FILE_BYTES", "100000"))
 login_rate_window: dict[str, tuple[int, int]] = {}
+login_rate_lock = threading.Lock()
+github_import_lock = threading.Lock()
 request_id_context: ContextVar[str] = ContextVar("request_id", default="system")
 REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
@@ -49,7 +56,14 @@ def db():
     connection.execute("PRAGMA busy_timeout = 15000")
     try:
         yield connection
-        connection.commit()
+        for attempt in range(SQLITE_WRITE_RETRIES):
+            try:
+                connection.commit()
+                break
+            except sqlite3.OperationalError as exc:
+                if "locked" not in str(exc).lower() or attempt == SQLITE_WRITE_RETRIES - 1:
+                    raise
+                time.sleep(0.05 * (2 ** attempt))
     finally:
         connection.close()
 
@@ -314,7 +328,7 @@ class GitHubImportInput(BaseModel):
     branch: str | None = Field(default=None, max_length=120)
     department: str = Field(default="all", min_length=1, max_length=80)
     min_role: Role = "employee"
-    max_files: int = Field(default=50, ge=1, le=200)
+    max_files: int = Field(default=50, ge=1, le=100)
 
 
 class SourceSyncInput(BaseModel):
@@ -338,6 +352,15 @@ def github_headers() -> dict[str, str]:
 
 
 def import_github_repository(payload: GitHubImportInput, user: CurrentUser) -> dict[str, object]:
+    if not github_import_lock.acquire(blocking=False):
+        raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "已有仓库同步任务正在执行，请稍后重试")
+    try:
+        return _import_github_repository(payload, user)
+    finally:
+        github_import_lock.release()
+
+
+def _import_github_repository(payload: GitHubImportInput, user: CurrentUser) -> dict[str, object]:
     owner, repository = github_repository(payload.repository_url)
     api_url = f"https://api.github.com/repos/{owner}/{repository}"
     source_key = f"github.com/{owner}/{repository}"
@@ -352,11 +375,17 @@ def import_github_repository(payload: GitHubImportInput, user: CurrentUser) -> d
             tree = tree_response.json().get("tree", [])
             paths = [item["path"] for item in tree if item.get("type") == "blob" and item["path"].lower().endswith((".md", ".txt", ".rst", ".py", ".js", ".ts", ".tsx", ".jsx", ".java", ".go", ".json", ".yml", ".yaml"))][:payload.max_files]
             files: list[tuple[str, str]] = []
+            total_bytes = 0
             for path in paths:
                 try:
                     content_response = client.get(f"https://raw.githubusercontent.com/{owner}/{repository}/{default_branch}/{path}")
-                    if content_response.is_success and content_response.text.strip():
-                        files.append((path, content_response.text[:100_000]))
+                    content_length = int(content_response.headers.get("content-length", "0"))
+                    if content_length > GITHUB_MAX_FILE_BYTES or total_bytes + content_length > GITHUB_MAX_TOTAL_BYTES:
+                        continue
+                    content = content_response.content[:GITHUB_MAX_FILE_BYTES]
+                    if content_response.is_success and content.strip() and total_bytes + len(content) <= GITHUB_MAX_TOTAL_BYTES:
+                        files.append((path, content.decode(content_response.encoding or "utf-8", errors="replace")))
+                        total_bytes += len(content)
                 except httpx.HTTPError:
                     # 单一文件失败不应阻断整个仓库的索引过程。
                     continue
@@ -425,16 +454,17 @@ def login(payload: LoginInput, response: Response, request: Request) -> dict[str
     if not erp_url or not integration_key:
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "ERP 集成认证尚未配置")
     client_ip = request.client.host if request.client else "unknown"
-    current_time = timestamp()
-    for ip, (started, _) in list(login_rate_window.items()):
-        if current_time - started >= LOGIN_RATE_WINDOW_SECONDS:
-            login_rate_window.pop(ip, None)
-    window_started, count = login_rate_window.get(client_ip, (timestamp(), 0))
-    if timestamp() - window_started >= LOGIN_RATE_WINDOW_SECONDS:
-        window_started, count = timestamp(), 0
-    if count >= LOGIN_RATE_MAX_REQUESTS:
-        raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "登录请求过于频繁，请稍后重试")
-    login_rate_window[client_ip] = (window_started, count + 1)
+    with login_rate_lock:
+        current_time = timestamp()
+        for ip, (started, _) in list(login_rate_window.items()):
+            if current_time - started >= LOGIN_RATE_WINDOW_SECONDS:
+                login_rate_window.pop(ip, None)
+        window_started, count = login_rate_window.get(client_ip, (current_time, 0))
+        if current_time - window_started >= LOGIN_RATE_WINDOW_SECONDS:
+            window_started, count = current_time, 0
+        if count >= LOGIN_RATE_MAX_REQUESTS:
+            raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "登录请求过于频繁，请稍后重试")
+        login_rate_window[client_ip] = (window_started, count + 1)
     try:
         erp_response = httpx.post(
             erp_url,
@@ -475,10 +505,13 @@ def logout(response: Response, session_token: str | None = Cookie(default=None, 
 @app.get("/api/summary")
 def summary(user: User) -> dict[str, object]:
     with db() as conn:
-        document_count = conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0]
-        chunk_count = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+        visibility = "(d.department IN (?, 'all') OR ?='admin') AND ? >= CASE d.min_role WHEN 'admin' THEN 3 WHEN 'manager' THEN 2 ELSE 1 END"
+        role_level = ROLE_LEVEL[user.role]
+        document_count = conn.execute(f"SELECT COUNT(*) FROM documents d WHERE {visibility}", (user.department, user.role, role_level)).fetchone()[0]
+        chunk_count = conn.execute(f"SELECT COUNT(*) FROM chunks c JOIN documents d ON d.id=c.document_id WHERE {visibility}", (user.department, user.role, role_level)).fetchone()[0]
         conversation_count = conn.execute("SELECT COUNT(*) FROM conversations WHERE user_id=?", (user.id,)).fetchone()[0]
-        agent_count = conn.execute("SELECT COUNT(*) FROM agents WHERE active=1").fetchone()[0]
+        agent_count = conn.execute("""SELECT COUNT(*) FROM agents WHERE active=1 AND (department IN (?, 'all') OR ?='admin')
+                                    AND ? >= CASE max_role WHEN 'admin' THEN 3 WHEN 'manager' THEN 2 ELSE 1 END""", (user.department, user.role, role_level)).fetchone()[0]
     return {
         "user": user.model_dump(),
         "documents": document_count,

@@ -117,3 +117,28 @@ def test_production_refuses_demo_data(monkeypatch):
         assert "SEED_DEMO_DATA" in str(exc)
     else:
         raise AssertionError("production demo data must be refused")
+
+
+def test_summary_only_counts_visible_resources():
+    Path(os.environ["DATABASE_PATH"]).unlink(missing_ok=True)
+    with TestClient(app) as client:
+        authenticate(client, "admin", "系统管理员", "admin", "all")
+        assert client.post("/users", json={"id": "finance-user", "name": "财务同事", "role": "employee", "department": "finance"}).status_code == 201
+        assert client.post("/documents", json={"title": "研发机密", "content": "engineering confidential", "department": "engineering", "min_role": "employee"}).status_code == 201
+        assert client.post("/documents", json={"title": "财务制度", "content": "finance policy", "department": "finance", "min_role": "employee"}).status_code == 201
+        authenticate(client, "finance-user", "财务同事", "employee", "finance")
+        summary = client.get("/api/summary")
+        assert summary.status_code == 200
+        assert summary.json()["documents"] == 1
+
+
+def test_github_import_is_serialized():
+    from app import main
+    assert main.github_import_lock.acquire(blocking=False)
+    try:
+        with TestClient(app) as client:
+            authenticate(client, "admin", "系统管理员", "admin", "all")
+            response = client.post("/documents/import/github", json={"repository_url": "https://github.com/acme/repo"})
+            assert response.status_code == 429
+    finally:
+        main.github_import_lock.release()
