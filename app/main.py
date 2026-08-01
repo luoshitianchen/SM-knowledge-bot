@@ -30,6 +30,7 @@ ROLE_LEVEL = {"employee": 1, "manager": 2, "admin": 3}
 Role = Literal["employee", "manager", "admin"]
 SESSION_COOKIE = "sm_kb_session"
 SESSION_TTL_SECONDS = int(os.getenv("KB_SESSION_TTL_SECONDS", "28800"))
+MAX_SESSIONS_PER_USER = int(os.getenv("KB_MAX_SESSIONS_PER_USER", "5"))
 LOGIN_RATE_WINDOW_SECONDS = int(os.getenv("KB_LOGIN_RATE_WINDOW_SECONDS", "60"))
 LOGIN_RATE_MAX_REQUESTS = int(os.getenv("KB_LOGIN_RATE_MAX_REQUESTS", "20"))
 MAX_REQUEST_BYTES = int(os.getenv("KB_MAX_REQUEST_BYTES", "1048576"))
@@ -242,6 +243,15 @@ def timestamp() -> int:
 
 def session_hash(token: str) -> str:
     return hashlib.sha256(token.encode()).hexdigest()
+
+
+def prune_user_sessions(conn: sqlite3.Connection, user_id: str) -> None:
+    """删除过期及超出上限的旧会话，限制凭据暴露面。"""
+    conn.execute("DELETE FROM auth_sessions WHERE expires_at<=?", (timestamp(),))
+    rows = conn.execute("SELECT token_hash FROM auth_sessions WHERE user_id=? ORDER BY created_at DESC", (user_id,)).fetchall()
+    stale = [(row["token_hash"],) for row in rows[MAX_SESSIONS_PER_USER:]]
+    if stale:
+        conn.executemany("DELETE FROM auth_sessions WHERE token_hash=?", stale)
 
 
 def current_user(session_token: str | None = Cookie(default=None, alias=SESSION_COOKIE)) -> CurrentUser:
@@ -492,6 +502,7 @@ def login(payload: LoginInput, response: Response, request: Request) -> dict[str
         conn.execute("""INSERT INTO users (id,name,role,department,active,created_at) VALUES (?,?,?,?,1,?)
                      ON CONFLICT(id) DO UPDATE SET name=excluded.name,role=excluded.role,department=excluded.department,active=1""", (user_id, name, role, department, now()))
         conn.execute("INSERT INTO auth_sessions (token_hash,user_id,expires_at,created_at,csrf_hash) VALUES (?,?,?,?,?)", (session_hash(token), user_id, timestamp() + SESSION_TTL_SECONDS, now(), session_hash(csrf_token)))
+        prune_user_sessions(conn, user_id)
         audit(conn, user_id, "erp.login", detail=f"department={department} role={role}")
     response.set_cookie(SESSION_COOKIE, token, max_age=SESSION_TTL_SECONDS, httponly=True, secure=os.getenv("KB_ENV", "development") == "production", samesite="strict", path="/")
     return {"message": "登录成功", "user": CurrentUser(id=user_id, name=name, role=role, department=department).model_dump(), "csrf_token": csrf_token}
