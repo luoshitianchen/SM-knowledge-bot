@@ -16,16 +16,29 @@
 ## 本地运行
 
 ```powershell
-cd C:\Users\Admin\Desktop\github项目\SM-knowledge-bot
-python -m venv .venv
+git clone https://github.com/luoshitianchen/SM-knowledge-bot.git
+cd SM-knowledge-bot
+py -3.11 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
-uvicorn app.main:app --reload
+$env:KB_ENABLE_DOCS = "true"
+uvicorn app.main:app --reload --port 8000
 ```
 
 访问 http://127.0.0.1:8000/docs 使用 Swagger 文档。Python 服务通过 ERP 集成认证建立 `HttpOnly` 会话 Cookie；业务接口不接受客户端传入的用户 ID。
 
 ## ERP 登录联动
+
+先从 GitHub 克隆并启动 ERP：
+
+```powershell
+git clone https://github.com/luoshitianchen/SM-ERP.git
+cd SM-ERP
+py -3.11 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+uvicorn app.main:app --reload --port 8100
+```
 
 企业部署时在 `.env` 配置 ERP 集成认证端点和共享集成密钥：
 
@@ -39,7 +52,8 @@ ERP_INTEGRATION_KEY=RANDOM_SHARED_INTEGRATION_KEY
 ### 一键启动与浏览器演示
 
 ```powershell
-cd C:\Users\Admin\Desktop\github项目\SM-knowledge-bot
+git clone https://github.com/luoshitianchen/SM-knowledge-bot.git
+cd SM-knowledge-bot
 .\start.ps1
 ```
 
@@ -48,7 +62,8 @@ cd C:\Users\Admin\Desktop\github项目\SM-knowledge-bot
 ### Docker 部署
 
 ```powershell
-cd C:\Users\Admin\Desktop\github项目\SM-knowledge-bot
+git clone https://github.com/luoshitianchen/SM-knowledge-bot.git
+cd SM-knowledge-bot
 Copy-Item .env.example .env
 .\deploy.ps1
 ```
@@ -112,7 +127,8 @@ docker compose up --build
 `java` 目录保留为历史演示实现，不包含当前 ERP 集成会话与安全加固能力。生产环境必须部署根目录 Python 服务，并通过 `SM-ERP` 的集成认证接口登录。
 
 ```powershell
-cd C:\Users\Admin\Desktop\github项目\SM-knowledge-bot
+git clone https://github.com/luoshitianchen/SM-knowledge-bot.git
+cd SM-knowledge-bot
 git pull origin main
 cd .\java
 .\start-java.ps1
@@ -129,7 +145,8 @@ Java 服务启动会自动写入并更新 `java/demo/操作指南-模拟知识�
 运行 Java 测试：
 
 ```powershell
-cd C:\Users\Admin\Desktop\github项目\SM-knowledge-bot\java
+git clone https://github.com/luoshitianchen/SM-knowledge-bot.git
+cd SM-knowledge-bot\java
 mvn test
 ```
 
