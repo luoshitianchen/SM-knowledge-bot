@@ -209,10 +209,13 @@ async def add_request_timing(request: Request, call_next):
             request_id_context.reset(context_token)
             return Response(status_code=status.HTTP_403_FORBIDDEN, content="CSRF validation failed", headers={"X-Request-Id": request_id})
     started = datetime.now(UTC)
-    response = await call_next(request)
-    request_id_context.reset(context_token)
+    try:
+        response = await call_next(request)
+    finally:
+        request_id_context.reset(context_token)
     elapsed_ms = (datetime.now(UTC) - started).total_seconds() * 1000
     response.headers["X-Process-Time-Ms"] = f"{elapsed_ms:.2f}"
+    response.headers["Server-Timing"] = f"app;dur={elapsed_ms:.2f}"
     response.headers["X-Request-Id"] = request_id
     logger.info(json.dumps({"request_id": request_id, "method": request.method, "path": request.url.path, "status": response.status_code, "duration_ms": round(elapsed_ms, 2)}, ensure_ascii=False))
     response.headers["X-Content-Type-Options"] = "nosniff"
