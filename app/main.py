@@ -120,6 +120,7 @@ def initialize_database() -> None:
         CREATE INDEX IF NOT EXISTS idx_conversations_user_updated ON conversations(user_id, updated_at DESC);
         CREATE INDEX IF NOT EXISTS idx_messages_conversation_created ON messages(conversation_id, created_at);
         CREATE INDEX IF NOT EXISTS idx_audit_logs_created ON audit_logs(created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_audit_logs_action_created ON audit_logs(action, created_at DESC);
         CREATE INDEX IF NOT EXISTS idx_source_runs_source_started ON source_sync_runs(source_id, started_at DESC);
         CREATE INDEX IF NOT EXISTS idx_agents_active_department ON agents(active, department);
         CREATE INDEX IF NOT EXISTS idx_auth_sessions_expiry ON auth_sessions(expires_at);

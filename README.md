@@ -69,6 +69,8 @@ Docker 默认仅监听 `127.0.0.1:8010`，不直接暴露到公网。应通过�
 
 ## 快速流程
 
+管理员审计查询支持分页和筛选：`GET /audit-logs?limit=50&offset=0&action=chat.answered&since=2026-01-01T00:00:00Z`。接口只返回管理员可见的审计记录，单页最多 100 条。
+
 1. 用 `POST /users` 创建用户（管理员）。
 2. 用 `POST /documents` 录入文档（经理/管理员）。
 3. 登录成功后，用 `POST /chat` 提问；浏览器自动携带会话 Cookie。
