@@ -84,6 +84,8 @@ def test_security_headers_and_request_id():
         assert response.headers["X-Content-Type-Options"] == "nosniff"
         assert float(response.headers["X-Process-Time-Ms"]) >= 0
         assert response.headers["Server-Timing"].startswith("app;dur=")
+        assert response.json()["service"] == "sm-knowledge-bot"
+        assert response.json()["checks"]["database"] == "ok"
 
 
 def test_rejects_oversized_request_body(monkeypatch):

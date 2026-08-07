@@ -441,13 +441,20 @@ def _import_github_repository(payload: GitHubImportInput, user: CurrentUser) -> 
 
 
 @app.get("/health")
-def health() -> dict[str, str]:
+def health() -> dict[str, object]:
     try:
         with db() as conn:
             conn.execute("SELECT 1").fetchone()
     except sqlite3.Error as exc:
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "数据库不可用") from exc
-    return {"status": "ok", "version": app.version, "database": "ok"}
+    return {
+        "status": "ok",
+        "service": "sm-knowledge-bot",
+        "version": app.version,
+        "database": "ok",
+        "checks": {"database": "ok"},
+        "timestamp": now(),
+    }
 
 
 @app.get("/readyz")
@@ -457,7 +464,7 @@ def ready() -> dict[str, str]:
         conn.execute("SELECT 1").fetchone()
     if os.getenv("KB_ENV", "development") == "production" and (not os.getenv("ERP_AUTH_URL") or not os.getenv("ERP_INTEGRATION_KEY")):
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "ERP 集成配置不可用")
-    return {"status": "ready"}
+    return {"status": "ready", "service": "sm-knowledge-bot", "version": app.version, "checks": {"database": "ok", "erp": "configured" if os.getenv("ERP_AUTH_URL") and os.getenv("ERP_INTEGRATION_KEY") else "development"}, "timestamp": now()}
 
 
 @app.post("/auth/login")
