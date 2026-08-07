@@ -171,7 +171,7 @@ async def lifespan(_: FastAPI):
 
 
 docs_enabled = os.getenv("KB_ENABLE_DOCS", "false").lower() == "true"
-app = FastAPI(title="SM Knowledge Bot", version="1.2.1", description="企业内部知识库问答服务", docs_url="/docs" if docs_enabled else None, redoc_url=None, openapi_url="/openapi.json" if docs_enabled else None, lifespan=lifespan)
+app = FastAPI(title="SM Knowledge Bot", version="2.0.0", description="企业内部知识库问答服务", docs_url="/docs" if docs_enabled else None, redoc_url=None, openapi_url="/openapi.json" if docs_enabled else None, lifespan=lifespan)
 app.add_middleware(TrustedHostMiddleware, allowed_hosts=allowed_hosts)
 app.add_middleware(
     CORSMiddleware,
