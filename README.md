@@ -1,6 +1,6 @@
 # SM Knowledge Bot
 
-**正式版：** [v1.2.1 发布说明与源码下载](https://github.com/luoshitianchen/SM-knowledge-bot/releases/tag/v1.2.1)
+**正式版：** [v2.0.0 发布说明与源码下载](https://github.com/luoshitianchen/SM-knowledge-bot/releases/tag/v2.0.0)
 
 企业内部知识库问答 Bot（FastAPI），提供**文档分块检索、多轮对话、部门与角色权限控制、审计日志**。
 
