@@ -86,6 +86,7 @@ def test_security_headers_and_request_id():
         assert response.headers["Server-Timing"].startswith("app;dur=")
         assert response.json()["service"] == "sm-knowledge-bot"
         assert response.json()["checks"]["database"] == "ok"
+        assert "X-Content-Type-Options" in response.headers
 
 
 def test_rejects_oversized_request_body(monkeypatch):
