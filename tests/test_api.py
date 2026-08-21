@@ -170,3 +170,40 @@ def test_session_pruning_keeps_latest_sessions(monkeypatch):
             conn.execute("INSERT OR REPLACE INTO auth_sessions (token_hash,user_id,expires_at,created_at,csrf_hash) VALUES (?,?,?,?,?)", (f"session-{index}", "admin", main.timestamp() + 3600, f"2026-01-01T00:00:0{index}+00:00", "csrf"))
         main.prune_user_sessions(conn, "admin")
         assert conn.execute("SELECT COUNT(*) FROM auth_sessions WHERE user_id='admin'").fetchone()[0] == 2
+
+def test_admin_ops_metrics_requires_admin_and_reports_runtime():
+    Path(os.environ["DATABASE_PATH"]).unlink(missing_ok=True)
+    with TestClient(app) as client:
+        authenticate(client, "employee-1", "普通员工", "employee", "engineering")
+        assert client.get("/api/ops/metrics").status_code == 403
+        authenticate(client, "admin", "系统管理员", "admin", "all")
+        response = client.get("/api/ops/metrics")
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["service"] == "sm-knowledge-bot"
+        assert payload["requests_total"] >= 1
+        assert "avg_latency_ms" in payload
+
+def test_web_console_bootstrap_uses_login_csrf_token():
+    html = Path("app/static/index.html").read_text(encoding="utf-8")
+    assert "csrfToken=d.csrf_token||''" in html
+    assert "userId()" not in html
+    assert "/api/ops/metrics" in html
+
+def test_api_rate_limit_is_enforced(monkeypatch):
+    from app import main
+    main.api_rate_window.clear()
+    monkeypatch.setattr(main, "API_RATE_MAX_REQUESTS", 1)
+    with TestClient(app) as client:
+        assert client.get("/health").status_code == 200
+        assert client.get("/health").status_code == 429
+
+
+def test_admin_audit_logs_do_not_expose_detail_field():
+    Path(os.environ["DATABASE_PATH"]).unlink(missing_ok=True)
+    with TestClient(app) as client:
+        authenticate(client, "admin", "系统管理员", "admin", "all")
+        client.post("/users", json={"id": "safe-audit", "name": "审计用户", "role": "employee", "department": "engineering"})
+        payload = client.get("/audit-logs?action=user.created").json()
+        assert payload["items"]
+        assert "detail" not in payload["items"][0]

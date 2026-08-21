@@ -24,6 +24,8 @@ from fastapi.responses import FileResponse
 import httpx
 from pydantic import BaseModel, Field
 
+VERSION = "2.3.0"
+ENVIRONMENT = os.getenv("KB_ENV", "development").lower()
 DATABASE_PATH = Path(os.getenv("DATABASE_PATH", "data/knowledge_bot.db"))
 DATABASE_PATH.parent.mkdir(parents=True, exist_ok=True)
 ROLE_LEVEL = {"employee": 1, "manager": 2, "admin": 3}
@@ -34,13 +36,19 @@ MAX_SESSIONS_PER_USER = int(os.getenv("KB_MAX_SESSIONS_PER_USER", "5"))
 LOGIN_RATE_WINDOW_SECONDS = int(os.getenv("KB_LOGIN_RATE_WINDOW_SECONDS", "60"))
 LOGIN_RATE_MAX_REQUESTS = int(os.getenv("KB_LOGIN_RATE_MAX_REQUESTS", "20"))
 MAX_REQUEST_BYTES = int(os.getenv("KB_MAX_REQUEST_BYTES", "1048576"))
+API_RATE_WINDOW_SECONDS = int(os.getenv("KB_API_RATE_WINDOW_SECONDS", "60"))
+API_RATE_MAX_REQUESTS = int(os.getenv("KB_API_RATE_MAX_REQUESTS", "600"))
 SQLITE_WRITE_RETRIES = int(os.getenv("KB_SQLITE_WRITE_RETRIES", "4"))
 GITHUB_MAX_TOTAL_BYTES = int(os.getenv("KB_GITHUB_MAX_TOTAL_BYTES", "2000000"))
 GITHUB_MAX_FILE_BYTES = int(os.getenv("KB_GITHUB_MAX_FILE_BYTES", "100000"))
 login_rate_window: dict[str, tuple[int, int]] = {}
 login_rate_lock = threading.Lock()
+api_rate_window: dict[str, tuple[int, int]] = {}
+api_rate_lock = threading.Lock()
 github_import_lock = threading.Lock()
 request_id_context: ContextVar[str] = ContextVar("request_id", default="system")
+metrics_lock = threading.Lock()
+metrics = {"requests_total": 0, "errors_total": 0, "latency_ms_total": 0.0}
 REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
 allowed_hosts = [host.strip() for host in os.getenv("KB_ALLOWED_HOSTS", "localhost,127.0.0.1,testserver").split(",") if host.strip()]
@@ -152,7 +160,7 @@ def seed_demo_data() -> None:
 
 
 def startup() -> None:
-    if os.getenv("KB_ENV", "development") == "production":
+    if os.getenv("KB_ENV", ENVIRONMENT).lower() == "production":
         if not os.getenv("ERP_AUTH_URL") or not os.getenv("ERP_INTEGRATION_KEY") or os.getenv("ERP_INTEGRATION_KEY", "").startswith("REPLACE_"):
             raise RuntimeError("生产环境必须配置 ERP_AUTH_URL 和 ERP_INTEGRATION_KEY")
         if any(host in {"*", "0.0.0.0"} for host in allowed_hosts):
@@ -171,7 +179,7 @@ async def lifespan(_: FastAPI):
 
 
 docs_enabled = os.getenv("KB_ENABLE_DOCS", "false").lower() == "true"
-app = FastAPI(title="SM Knowledge Bot", version="2.0.0", description="企业内部知识库问答服务", docs_url="/docs" if docs_enabled else None, redoc_url=None, openapi_url="/openapi.json" if docs_enabled else None, lifespan=lifespan)
+app = FastAPI(title="SM Knowledge Bot", version=VERSION, description="企业内部知识库问答服务", docs_url="/docs" if docs_enabled else None, redoc_url=None, openapi_url="/openapi.json" if docs_enabled else None, lifespan=lifespan)
 app.add_middleware(TrustedHostMiddleware, allowed_hosts=allowed_hosts)
 app.add_middleware(
     CORSMiddleware,
@@ -199,6 +207,12 @@ async def add_request_timing(request: Request, call_next):
         if body_size < 0 or body_size > MAX_REQUEST_BYTES:
             request_id_context.reset(context_token)
             return Response(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, content="Request body too large", headers={"X-Request-Id": request_id})
+    client_ip = request.client.host if request.client else "unknown"
+    try:
+        consume_rate_limit(api_rate_window, api_rate_lock, f"{client_ip}:{request.url.path}", API_RATE_WINDOW_SECONDS, API_RATE_MAX_REQUESTS)
+    except HTTPException as exc:
+        request_id_context.reset(context_token)
+        return Response(status_code=exc.status_code, content=str(exc.detail), headers={"X-Request-Id": request_id, "Retry-After": str(API_RATE_WINDOW_SECONDS)})
     if request.method in {"POST", "PATCH", "PUT", "DELETE"} and request.url.path != "/auth/login":
         token, csrf_token = request.cookies.get(SESSION_COOKIE), request.headers.get("X-CSRF-Token")
         if not token or not csrf_token:
@@ -218,14 +232,19 @@ async def add_request_timing(request: Request, call_next):
     response.headers["X-Process-Time-Ms"] = f"{elapsed_ms:.2f}"
     response.headers["Server-Timing"] = f"app;dur={elapsed_ms:.2f}"
     response.headers["X-Request-Id"] = request_id
+    with metrics_lock:
+        metrics["requests_total"] += 1
+        metrics["latency_ms_total"] += elapsed_ms
+        if response.status_code >= 500:
+            metrics["errors_total"] += 1
     logger.info(json.dumps({"request_id": request_id, "method": request.method, "path": request.url.path, "status": response.status_code, "duration_ms": round(elapsed_ms, 2)}, ensure_ascii=False))
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["Referrer-Policy"] = "no-referrer"
-    response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
-    response.headers["Content-Security-Policy"] = "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; base-uri 'self'; frame-ancestors 'none'"
+    response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=(), payment=(), usb=()"
+    response.headers["Content-Security-Policy"] = "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; base-uri 'self'; form-action 'self'; frame-ancestors 'none'"
     response.headers["Cache-Control"] = "no-store" if request.url.path.startswith(("/api/", "/auth/", "/sources", "/agents", "/chat")) else "no-cache"
-    if os.getenv("KB_ENV", "development") == "production":
+    if os.getenv("KB_ENV", ENVIRONMENT).lower() == "production":
         response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
     return response
 
@@ -240,6 +259,20 @@ class CurrentUser(BaseModel):
 def timestamp() -> int:
     return int(datetime.now(UTC).timestamp())
 
+
+
+def consume_rate_limit(window: dict[str, tuple[int, int]], window_lock: threading.Lock, key: str, period: int, maximum: int) -> None:
+    with window_lock:
+        current_time = timestamp()
+        for item_key, (started, _) in list(window.items()):
+            if current_time - started >= period:
+                window.pop(item_key, None)
+        window_started, count = window.get(key, (current_time, 0))
+        if current_time - window_started >= period:
+            window_started, count = current_time, 0
+        if count >= maximum:
+            raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "请求过于频繁，请稍后重试")
+        window[key] = (window_started, count + 1)
 
 def session_hash(token: str) -> str:
     return hashlib.sha256(token.encode()).hexdigest()
@@ -462,7 +495,7 @@ def ready() -> dict[str, str]:
     """编排平台就绪探针：确认数据库与 ERP 集成配置有效。"""
     with db() as conn:
         conn.execute("SELECT 1").fetchone()
-    if os.getenv("KB_ENV", "development") == "production" and (not os.getenv("ERP_AUTH_URL") or not os.getenv("ERP_INTEGRATION_KEY")):
+    if os.getenv("KB_ENV", ENVIRONMENT).lower() == "production" and (not os.getenv("ERP_AUTH_URL") or not os.getenv("ERP_INTEGRATION_KEY")):
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "ERP 集成配置不可用")
     return {"status": "ready", "service": "sm-knowledge-bot", "version": app.version, "checks": {"database": "ok", "erp": "configured" if os.getenv("ERP_AUTH_URL") and os.getenv("ERP_INTEGRATION_KEY") else "development"}, "timestamp": now()}
 
@@ -475,17 +508,7 @@ def login(payload: LoginInput, response: Response, request: Request) -> dict[str
     if not erp_url or not integration_key:
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "ERP 集成认证尚未配置")
     client_ip = request.client.host if request.client else "unknown"
-    with login_rate_lock:
-        current_time = timestamp()
-        for ip, (started, _) in list(login_rate_window.items()):
-            if current_time - started >= LOGIN_RATE_WINDOW_SECONDS:
-                login_rate_window.pop(ip, None)
-        window_started, count = login_rate_window.get(client_ip, (current_time, 0))
-        if current_time - window_started >= LOGIN_RATE_WINDOW_SECONDS:
-            window_started, count = current_time, 0
-        if count >= LOGIN_RATE_MAX_REQUESTS:
-            raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "登录请求过于频繁，请稍后重试")
-        login_rate_window[client_ip] = (window_started, count + 1)
+    consume_rate_limit(login_rate_window, login_rate_lock, client_ip, LOGIN_RATE_WINDOW_SECONDS, LOGIN_RATE_MAX_REQUESTS)
     try:
         erp_response = httpx.post(
             erp_url,
@@ -511,7 +534,7 @@ def login(payload: LoginInput, response: Response, request: Request) -> dict[str
         conn.execute("INSERT INTO auth_sessions (token_hash,user_id,expires_at,created_at,csrf_hash) VALUES (?,?,?,?,?)", (session_hash(token), user_id, timestamp() + SESSION_TTL_SECONDS, now(), session_hash(csrf_token)))
         prune_user_sessions(conn, user_id)
         audit(conn, user_id, "erp.login", detail=f"department={department} role={role}")
-    response.set_cookie(SESSION_COOKIE, token, max_age=SESSION_TTL_SECONDS, httponly=True, secure=os.getenv("KB_ENV", "development") == "production", samesite="strict", path="/")
+    response.set_cookie(SESSION_COOKIE, token, max_age=SESSION_TTL_SECONDS, httponly=True, secure=os.getenv("KB_ENV", ENVIRONMENT).lower() == "production", samesite="strict", path="/")
     return {"message": "登录成功", "user": CurrentUser(id=user_id, name=name, role=role, department=department).model_dump(), "csrf_token": csrf_token}
 
 
@@ -541,6 +564,16 @@ def summary(user: User) -> dict[str, object]:
         "conversations": conversation_count,
         "agents": agent_count,
     }
+
+
+@app.get("/api/ops/metrics")
+def ops_metrics(user: User) -> dict[str, object]:
+    require_admin(user)
+    with metrics_lock:
+        snapshot = dict(metrics)
+    total = int(snapshot["requests_total"])
+    avg_latency = round(float(snapshot["latency_ms_total"]) / total, 2) if total else 0.0
+    return {"service": "sm-knowledge-bot", "version": app.version, "requests_total": total, "errors_total": int(snapshot["errors_total"]), "avg_latency_ms": avg_latency}
 
 
 @app.get("/", include_in_schema=False)
@@ -764,4 +797,5 @@ def list_audit_logs(
     with db() as conn:
         total = conn.execute(f"SELECT COUNT(*) FROM audit_logs{where}", params).fetchone()[0]
         rows = conn.execute(f"SELECT * FROM audit_logs{where} ORDER BY created_at DESC LIMIT ? OFFSET ?", [*params, limit, offset]).fetchall()
-    return {"items": [dict(row) for row in rows], "total": total, "limit": limit, "offset": offset}
+    return {"items": [{k: v for k, v in dict(row).items() if k != "detail"} for row in rows], "total": total, "limit": limit, "offset": offset}
+

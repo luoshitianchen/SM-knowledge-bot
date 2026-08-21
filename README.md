@@ -155,3 +155,52 @@ mvn test
 ## 生产接入建议
 
 将 `current_user` 替换为企业 SSO/JWT 验证，并以其中的用户 ID、部门及角色作为唯一可信身份来源；将 SQLite 迁移至 PostgreSQL + pgvector/Qdrant；在 `chat` 中将检索出的来源片段传给企业批准的 LLM，并保留现有权限过滤和审计记录。
+
+## v2.1 企业维护升级
+- 统一版本提升到 `2.1.0`，`/health` 与 `/readyz` 可用于负载均衡、容器编排和桌面端健康检查。
+- 默认开启最小权限会话模型：HttpOnly Cookie、CSRF Header、SameSite=Strict、生产环境 HSTS。
+- 增强安全头：`X-Content-Type-Options`、`X-Frame-Options`、`Referrer-Policy`、`Permissions-Policy`、`Content-Security-Policy`。
+- 本地启动文档仅保留 GitHub 拉取方式，避免写入个人磁盘路径：
+
+```powershell
+git clone https://github.com/luoshitianchen/SM-knowledge-bot.git
+cd SM-knowledge-bot
+py -3.11 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+uvicorn app.main:app --reload
+```
+
+### v2.1 运维观测接口
+管理员登录后可访问：
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:8000/api/ops/metrics -WebSession $session
+```
+
+返回请求总量、错误总量、平均延迟，便于接入企业监控平台或桌面融合门户。
+
+### v2.1 本地质量门禁
+提交前推荐执行：
+
+```powershell
+.\quality.ps1
+```
+
+如只进行快速回归测试：
+
+```powershell
+.\quality.ps1 -SkipAudit
+```
+
+## v2.2 全量升级
+- 服务版本统一提升到 `2.2.0`。
+- Web 控制台登录后自动保存服务端返回的 CSRF Token，前端写操作可直接完成会话校验。
+- 运行状态页接入 `/api/ops/metrics`，显示请求总量、错误总量和延迟指标。
+
+## v2.3 安全防护增强
+- 服务版本统一提升到 `2.3.0`。
+- 新增全局 API 速率限制，登录限流之外进一步保护普通接口，降低接口滥用与资源耗尽风险。
+- 速率限制命中后返回 `429` 和 `Retry-After`，便于前端、网关与监控系统识别。
+- CSP 增加 `connect-src`、`img-src`、`form-action`，继续收紧浏览器侧执行边界。
+- 管理员审计查询默认不返回 `detail` 字段，降低敏感审计上下文泄露风险。
