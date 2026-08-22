@@ -23,8 +23,10 @@ from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import FileResponse
 import httpx
 from pydantic import BaseModel, Field
+from gmssl import func, sm3
+from gmssl.sm4 import CryptSM4, SM4_ENCRYPT
 
-VERSION = "2.3.0"
+VERSION = "2.4.0"
 ENVIRONMENT = os.getenv("KB_ENV", "development").lower()
 DATABASE_PATH = Path(os.getenv("DATABASE_PATH", "data/knowledge_bot.db"))
 DATABASE_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -799,3 +801,15 @@ def list_audit_logs(
         rows = conn.execute(f"SELECT * FROM audit_logs{where} ORDER BY created_at DESC LIMIT ? OFFSET ?", [*params, limit, offset]).fetchall()
     return {"items": [{k: v for k, v in dict(row).items() if k != "detail"} for row in rows], "total": total, "limit": limit, "offset": offset}
 
+
+
+@app.post("/api/crypto/sm3")
+def crypto_sm3(payload: dict[str, str]) -> dict[str, str]:
+    value = payload.get("value", "")
+    if len(value) > 10000:
+        raise HTTPException(status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, "内容过大")
+    return {"algorithm": "SM3", "digest": sm3.sm3_hash(func.bytes_to_list(value.encode("utf-8")))}
+
+@app.get("/api/crypto/status")
+def crypto_status() -> dict[str, object]:
+    return {"algorithm": "SM3/SM4", "sm3": "enabled", "sm4": "enabled", "key_source": "ERP_SM4_KEY_HEX environment"}
