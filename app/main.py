@@ -1,13 +1,14 @@
-"""SM Knowledge Bot：具备持久化、检索、会话和 RBAC 的企业知识库 API。"""
+"""SM Knowledge Bot：具备持久化、检索、会话、RBAC 与统一企业级基线的知识库 API。"""
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
+import json
 import os
 import re
-import sqlite3
 import secrets
-import hashlib
-import json
-import logging
+import sqlite3
 import threading
 import time
 from contextvars import ContextVar
@@ -24,9 +25,9 @@ from fastapi.responses import FileResponse
 import httpx
 from pydantic import BaseModel, Field
 from gmssl import func, sm3
-from gmssl.sm4 import CryptSM4, SM4_ENCRYPT
+from gmssl.sm4 import CryptSM4, SM4_DECRYPT, SM4_ENCRYPT
 
-VERSION = "2.4.0"
+VERSION = "2.5.0"
 ENVIRONMENT = os.getenv("KB_ENV", "development").lower()
 DATABASE_PATH = Path(os.getenv("DATABASE_PATH", "data/knowledge_bot.db"))
 DATABASE_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -43,6 +44,9 @@ API_RATE_MAX_REQUESTS = int(os.getenv("KB_API_RATE_MAX_REQUESTS", "600"))
 SQLITE_WRITE_RETRIES = int(os.getenv("KB_SQLITE_WRITE_RETRIES", "4"))
 GITHUB_MAX_TOTAL_BYTES = int(os.getenv("KB_GITHUB_MAX_TOTAL_BYTES", "2000000"))
 GITHUB_MAX_FILE_BYTES = int(os.getenv("KB_GITHUB_MAX_FILE_BYTES", "100000"))
+JWT_SECRET = os.getenv("SM_JWT_SECRET", "")
+AUDIT_CENTER_URL = os.getenv("SM_AUDIT_CENTER_URL", "")
+SM_INTERNAL_API_KEY = os.getenv("SM_INTERNAL_API_KEY", "")
 login_rate_window: dict[str, tuple[int, int]] = {}
 login_rate_lock = threading.Lock()
 api_rate_window: dict[str, tuple[int, int]] = {}
@@ -56,11 +60,36 @@ REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 allowed_hosts = [host.strip() for host in os.getenv("KB_ALLOWED_HOSTS", "localhost,127.0.0.1,testserver").split(",") if host.strip()]
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(message)s")
 logger = logging.getLogger("sm_knowledge_bot")
+import logging
+
+
+def b64url_encode(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
+
+
+def b64url_decode(data: str) -> bytes:
+    return base64.urlsafe_b64decode(data + "=" * (-len(data) % 4))
+
+
+def verify_jwt(token: str) -> dict[str, object] | None:
+    if not JWT_SECRET:
+        return None
+    try:
+        header_b64, claims_b64, signature_b64 = token.split(".")
+        signing_input = f"{header_b64}.{claims_b64}".encode()
+        expected = hmac.new(JWT_SECRET.encode(), signing_input, hashlib.sha256).digest()
+        if not hmac.compare_digest(expected, b64url_decode(signature_b64)):
+            return None
+        claims = json.loads(b64url_decode(claims_b64))
+        if int(claims.get("exp", 0)) < timestamp():
+            return None
+        return claims
+    except Exception:
+        return None
 
 
 @contextmanager
 def db():
-    # WAL 允许读取与写入并行，busy_timeout 避免并发短暂写锁直接导致请求失败。
     connection = sqlite3.connect(DATABASE_PATH, timeout=15)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys = ON")
@@ -83,9 +112,42 @@ def now() -> str:
     return datetime.now(UTC).isoformat()
 
 
+def timestamp() -> int:
+    return int(datetime.now(UTC).timestamp())
+
+
+def sm3_hex(data: bytes) -> str:
+    return sm3.sm3_hash(func.bytes_to_list(data))
+
+
+def _sm4_key() -> bytes:
+    with db() as conn:
+        row = conn.execute("SELECT value FROM settings WHERE key='sm4_key_hex'").fetchone()
+        if not row:
+            key_hex = secrets.token_hex(16)
+            conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('sm4_key_hex', ?)", (key_hex,))
+            conn.commit()
+            return bytes.fromhex(key_hex)
+    return bytes.fromhex(row["value"])
+
+
+def sm4_crypt(value: bytes, encrypt: bool) -> bytes:
+    cipher = CryptSM4()
+    cipher.set_key(_sm4_key(), SM4_ENCRYPT if encrypt else SM4_DECRYPT)
+    if encrypt:
+        iv = secrets.token_bytes(16)
+        return iv + cipher.crypt_cbc(iv, value)
+    if len(value) < 16:
+        raise ValueError("ciphertext too short")
+    iv, body = value[:16], value[16:]
+    cipher.set_key(_sm4_key(), SM4_DECRYPT)
+    return cipher.crypt_cbc(iv, body)
+
+
 def initialize_database() -> None:
     with db() as conn:
         conn.executescript("""
+        CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS users (
           id TEXT PRIMARY KEY, name TEXT NOT NULL, role TEXT NOT NULL,
           department TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL
@@ -169,6 +231,8 @@ def startup() -> None:
             raise RuntimeError("生产环境 KB_ALLOWED_HOSTS 不可包含通配主机")
         if os.getenv("SEED_DEMO_DATA", "false").lower() == "true":
             raise RuntimeError("生产环境禁止启用 SEED_DEMO_DATA")
+        if not JWT_SECRET:
+            raise RuntimeError("生产环境必须设置 SM_JWT_SECRET")
     initialize_database()
     if os.getenv("SEED_DEMO_DATA", "true").lower() == "true":
         seed_demo_data()
@@ -188,13 +252,12 @@ app.add_middleware(
     allow_origins=os.getenv("CORS_ORIGINS", "http://localhost:3000").split(","),
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allow_headers=["Content-Type", "X-CSRF-Token", "X-Request-Id"],
+    allow_headers=["Content-Type", "X-CSRF-Token", "X-Request-Id", "Authorization"],
 )
 
 
 @app.middleware("http")
 async def add_request_timing(request: Request, call_next):
-    """为控制台和监控提供轻量级请求耗时指标。"""
     supplied_request_id = request.headers.get("X-Request-Id", "")
     request_id = supplied_request_id if REQUEST_ID_PATTERN.fullmatch(supplied_request_id) else str(uuid4())
     request.state.request_id = request_id
@@ -215,7 +278,14 @@ async def add_request_timing(request: Request, call_next):
     except HTTPException as exc:
         request_id_context.reset(context_token)
         return Response(status_code=exc.status_code, content=str(exc.detail), headers={"X-Request-Id": request_id, "Retry-After": str(API_RATE_WINDOW_SECONDS)})
-    if request.method in {"POST", "PATCH", "PUT", "DELETE"} and request.url.path != "/auth/login":
+    authorization = request.headers.get("Authorization", "")
+    bearer_authenticated = False
+    if authorization.startswith("Bearer "):
+        if not (JWT_SECRET and verify_jwt(authorization[7:])):
+            request_id_context.reset(context_token)
+            return Response(status_code=status.HTTP_401_UNAUTHORIZED, content="认证无效", headers={"X-Request-Id": request_id})
+        bearer_authenticated = True
+    if request.method in {"POST", "PATCH", "PUT", "DELETE"} and not bearer_authenticated and request.url.path != "/auth/login":
         token, csrf_token = request.cookies.get(SESSION_COOKIE), request.headers.get("X-CSRF-Token")
         if not token or not csrf_token:
             request_id_context.reset(context_token)
@@ -258,11 +328,6 @@ class CurrentUser(BaseModel):
     department: str
 
 
-def timestamp() -> int:
-    return int(datetime.now(UTC).timestamp())
-
-
-
 def consume_rate_limit(window: dict[str, tuple[int, int]], window_lock: threading.Lock, key: str, period: int, maximum: int) -> None:
     with window_lock:
         current_time = timestamp()
@@ -276,6 +341,7 @@ def consume_rate_limit(window: dict[str, tuple[int, int]], window_lock: threadin
             raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "请求过于频繁，请稍后重试")
         window[key] = (window_started, count + 1)
 
+
 def session_hash(token: str) -> str:
     return hashlib.sha256(token.encode()).hexdigest()
 
@@ -286,7 +352,7 @@ def prune_user_sessions(conn: sqlite3.Connection, user_id: str) -> None:
     rows = conn.execute("SELECT token_hash FROM auth_sessions WHERE user_id=? ORDER BY created_at DESC", (user_id,)).fetchall()
     stale = [(row["token_hash"],) for row in rows[MAX_SESSIONS_PER_USER:]]
     if stale:
-        conn.executemany("DELETE FROM auth_sessions WHERE token_hash=?", stale)
+        conn.executemany("DELETE FROM auth_sessions WHERE token_hash=?".replace("?", "?", 1), stale)
 
 
 def current_user(session_token: str | None = Cookie(default=None, alias=SESSION_COOKIE)) -> CurrentUser:
@@ -310,13 +376,25 @@ def require_admin(user: User) -> CurrentUser:
     return user
 
 
+def _forward_audit(user_id: str, action: str, resource_id: str | None, detail: str, request_id: str) -> None:
+    import urllib.request as _ur
+    try:
+        event = {"event_id": str(uuid4()), "service": "sm-knowledge-bot", "action": action, "actor": user_id, "timestamp": now(), "request_id": request_id, "trace_id": "", "detail": detail[:2000]}
+        body = json.dumps(event, ensure_ascii=False).encode("utf-8")
+        req = _ur.Request(AUDIT_CENTER_URL.rstrip("/") + "/api/audit/events", data=body, headers={"Content-Type": "application/json", "X-Internal-Token": SM_INTERNAL_API_KEY}, method="POST")
+        _ur.urlopen(req, timeout=2)
+    except Exception:
+        pass
+
+
 def audit(conn: sqlite3.Connection, user_id: str, action: str, resource_id: str | None = None, detail: str = "") -> None:
     enriched = f"request_id={request_id_context.get()} {detail}".strip()
     conn.execute("INSERT INTO audit_logs VALUES (?,?,?,?,?,?)", (str(uuid4()), user_id, action, resource_id, enriched, now()))
+    if AUDIT_CENTER_URL:
+        threading.Thread(target=_forward_audit, args=(user_id, action, resource_id, enriched, request_id_context.get()), daemon=True).start()
 
 
 def normalized_terms(text: str) -> set[str]:
-    # 同时保留英文词和中文单字/双字 gram，适合不依赖外部服务的中英文基础检索。
     latin = re.findall(r"[a-zA-Z0-9_]+", text.lower())
     chinese = "".join(re.findall(r"[\u4e00-\u9fff]", text))
     grams = list(chinese) + [chinese[i:i + 2] for i in range(max(0, len(chinese) - 1))]
@@ -385,7 +463,6 @@ class SourceSyncInput(BaseModel):
 
 
 def github_repository(repository_url: str) -> tuple[str, str]:
-    """解析标准 GitHub HTTPS/SSH 仓库地址。"""
     match = re.fullmatch(r"(?:https://github\.com/|git@github\.com:)([\w.-]+)/([\w.-]+?)(?:\.git)?/?", repository_url.strip())
     if not match:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "repository_url 必须是 GitHub 仓库地址")
@@ -394,7 +471,6 @@ def github_repository(repository_url: str) -> tuple[str, str]:
 
 def github_headers() -> dict[str, str]:
     headers = {"Accept": "application/vnd.github+json", "User-Agent": "SM-Knowledge-Bot"}
-    # 私有仓库在服务端设置 GITHUB_TOKEN；Token 不经 API 请求传递或持久化。
     if token := os.getenv("GITHUB_TOKEN"):
         headers["Authorization"] = f"Bearer {token}"
     return headers
@@ -436,7 +512,6 @@ def _import_github_repository(payload: GitHubImportInput, user: CurrentUser) -> 
                         files.append((path, content.decode(content_response.encoding or "utf-8", errors="replace")))
                         total_bytes += len(content)
                 except httpx.HTTPError:
-                    # 单一文件失败不应阻断整个仓库的索引过程。
                     continue
     except httpx.HTTPStatusError as exc:
         with db() as conn:
@@ -452,7 +527,6 @@ def _import_github_repository(payload: GitHubImportInput, user: CurrentUser) -> 
     source_prefix = f"github:{owner}/{repository}:{default_branch}:"
     inserted_chunks = 0
     with db() as conn:
-        # 同一分支再次同步时，先删除旧索引，避免检索重复。
         old_documents = conn.execute("SELECT id FROM documents WHERE title LIKE ?", (source_prefix + "%",)).fetchall()
         for old in old_documents:
             conn.execute("DELETE FROM chunks WHERE document_id=?", (old["id"],))
@@ -487,14 +561,13 @@ def health() -> dict[str, object]:
         "service": "sm-knowledge-bot",
         "version": app.version,
         "database": "ok",
-        "checks": {"database": "ok"},
+        "checks": {"database": "ok", "crypto": "sm3-sm4"},
         "timestamp": now(),
     }
 
 
 @app.get("/readyz")
 def ready() -> dict[str, str]:
-    """编排平台就绪探针：确认数据库与 ERP 集成配置有效。"""
     with db() as conn:
         conn.execute("SELECT 1").fetchone()
     if os.getenv("KB_ENV", ENVIRONMENT).lower() == "production" and (not os.getenv("ERP_AUTH_URL") or not os.getenv("ERP_INTEGRATION_KEY")):
@@ -504,7 +577,6 @@ def ready() -> dict[str, str]:
 
 @app.post("/auth/login")
 def login(payload: LoginInput, response: Response, request: Request) -> dict[str, object]:
-    """经 ERP 集成接口认证后签发本项目专用 HttpOnly 会话。"""
     erp_url = os.getenv("ERP_AUTH_URL")
     integration_key = os.getenv("ERP_INTEGRATION_KEY")
     if not erp_url or not integration_key:
@@ -576,6 +648,18 @@ def ops_metrics(user: User) -> dict[str, object]:
     total = int(snapshot["requests_total"])
     avg_latency = round(float(snapshot["latency_ms_total"]) / total, 2) if total else 0.0
     return {"service": "sm-knowledge-bot", "version": app.version, "requests_total": total, "errors_total": int(snapshot["errors_total"]), "avg_latency_ms": avg_latency}
+
+
+@app.get("/metrics")
+def prometheus_metrics() -> Response:
+    with metrics_lock:
+        snapshot = dict(metrics)
+    body = (
+        f"sm_knowledge_bot_requests_total {int(snapshot['requests_total'])}"
+        f"\nsm_knowledge_bot_errors_total {int(snapshot['errors_total'])}"
+        f"\nsm_knowledge_bot_latency_ms_total {snapshot['latency_ms_total']:.2f}\n"
+    )
+    return Response(content=body, media_type="text/plain; version=0.0.4")
 
 
 @app.get("/", include_in_schema=False)
@@ -737,7 +821,6 @@ def chat(payload: ChatInput, user: User) -> dict[str, object]:
         agent = dict(row)
         if agent["department"] not in {"all", user.department} and user.role != "admin":
             raise HTTPException(status.HTTP_403_FORBIDDEN, "无权使用该 AI Agent")
-        # Agent 仅可收缩权限：调用用户权限与 Agent 上限取较低值。
         effective_role = min(ROLE_LEVEL[user.role], ROLE_LEVEL[agent["max_role"]])
         effective_department = user.department if agent["department"] == "all" else agent["department"]
         effective_user = CurrentUser(id=user.id, name=user.name, role=next(role for role, level in ROLE_LEVEL.items() if level == effective_role), department=effective_department)
@@ -782,7 +865,6 @@ def list_audit_logs(
     action: str | None = Query(default=None, min_length=1, max_length=100),
     since: str | None = Query(default=None, max_length=40),
 ) -> dict[str, object]:
-    """管理员审计查询：分页与受限筛选避免全表读取。"""
     require_admin(user)
     clauses, params = [], []
     if action:
@@ -802,6 +884,19 @@ def list_audit_logs(
     return {"items": [{k: v for k, v in dict(row).items() if k != "detail"} for row in rows], "total": total, "limit": limit, "offset": offset}
 
 
+@app.get("/api/integration/manifest")
+def integration_manifest() -> dict[str, object]:
+    return {
+        "service": "sm-knowledge-bot",
+        "name": "SM Knowledge Bot",
+        "version": app.version,
+        "dependencies": ["sm-iam", "sm-audit-log-center", "sm-erp"],
+        "events": ["health.checked", "document.changed", "chat.answered", "audit.recorded"],
+        "health_path": "/health",
+        "metrics_path": "/api/ops/metrics",
+        "overview_path": "/api/summary",
+    }
+
 
 @app.post("/api/crypto/sm3")
 def crypto_sm3(payload: dict[str, str]) -> dict[str, str]:
@@ -810,6 +905,46 @@ def crypto_sm3(payload: dict[str, str]) -> dict[str, str]:
         raise HTTPException(status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, "内容过大")
     return {"algorithm": "SM3", "digest": sm3.sm3_hash(func.bytes_to_list(value.encode("utf-8")))}
 
+
+@app.post("/api/crypto/encrypt")
+def crypto_encrypt(payload: dict[str, str]) -> dict[str, str]:
+    value = payload.get("value", "")
+    if len(value) > 10000:
+        raise HTTPException(status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, "内容过大")
+    return {"algorithm": "SM4-CBC", "ciphertext": sm4_crypt(value.encode("utf-8"), True).hex()}
+
+
+@app.post("/api/crypto/decrypt")
+def crypto_decrypt(payload: dict[str, str]) -> dict[str, str]:
+    try:
+        value = bytes.fromhex(payload.get("value", ""))
+    except ValueError:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "密文必须是十六进制")
+    return {"algorithm": "SM4-CBC", "plaintext": sm4_crypt(value, False).decode("utf-8")}
+
+
 @app.get("/api/crypto/status")
 def crypto_status() -> dict[str, object]:
-    return {"algorithm": "SM3/SM4", "sm3": "enabled", "sm4": "enabled", "key_source": "ERP_SM4_KEY_HEX environment"}
+    return {"algorithm": "SM3/SM4", "sm3": "enabled", "sm4": "enabled", "key_source": "persisted setting"}
+
+
+@app.get("/api/security/baseline")
+def security_baseline() -> dict[str, object]:
+    return {
+        "service": "sm-knowledge-bot",
+        "version": app.version,
+        "controls": {
+            "trusted_host": True,
+            "security_headers": True,
+            "csp": True,
+            "csrf": True,
+            "rate_limit": True,
+            "sm3": True,
+            "sm4": True,
+            "jwt": bool(JWT_SECRET),
+            "internal_token": bool(SM_INTERNAL_API_KEY),
+            "audit_persistence": True,
+            "audit_forwarding": bool(AUDIT_CENTER_URL),
+        },
+        "recommended": ["OIDC/MFA", "KMS/HSM", "centralized audit", "OpenTelemetry"],
+    }
