@@ -5,6 +5,7 @@ import base64
 import hashlib
 import hmac
 import json
+import logging
 import os
 import re
 import secrets
@@ -18,7 +19,7 @@ from pathlib import Path
 from typing import Annotated, Literal
 from uuid import uuid4
 
-from fastapi import Cookie, Depends, FastAPI, Header, HTTPException, Query, Request, Response, status
+from fastapi import Cookie, Depends, FastAPI, HTTPException, Query, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import FileResponse
@@ -60,7 +61,6 @@ REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 allowed_hosts = [host.strip() for host in os.getenv("KB_ALLOWED_HOSTS", "localhost,127.0.0.1,testserver").split(",") if host.strip()]
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(message)s")
 logger = logging.getLogger("sm_knowledge_bot")
-import logging
 
 
 def b64url_encode(data: bytes) -> str:
@@ -919,7 +919,7 @@ def crypto_decrypt(payload: dict[str, str]) -> dict[str, str]:
     try:
         value = bytes.fromhex(payload.get("value", ""))
     except ValueError:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "密文必须是十六进制")
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "密文必须是十六进制") from None
     return {"algorithm": "SM4-CBC", "plaintext": sm4_crypt(value, False).decode("utf-8")}
 
 
