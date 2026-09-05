@@ -28,7 +28,7 @@ from pydantic import BaseModel, Field
 from gmssl import func, sm3
 from gmssl.sm4 import CryptSM4, SM4_DECRYPT, SM4_ENCRYPT
 
-VERSION = "2.5.0"
+VERSION = "3.0.0"
 ENVIRONMENT = os.getenv("KB_ENV", "development").lower()
 DATABASE_PATH = Path(os.getenv("DATABASE_PATH", "data/knowledge_bot.db"))
 DATABASE_PATH.parent.mkdir(parents=True, exist_ok=True)
