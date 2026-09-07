@@ -227,7 +227,7 @@ def startup() -> None:
     if os.getenv("KB_ENV", ENVIRONMENT).lower() == "production":
         if not os.getenv("ERP_AUTH_URL") or not os.getenv("ERP_INTEGRATION_KEY") or os.getenv("ERP_INTEGRATION_KEY", "").startswith("REPLACE_"):
             raise RuntimeError("生产环境必须配置 ERP_AUTH_URL 和 ERP_INTEGRATION_KEY")
-        if any(host in {"*", "0.0.0.0"} for host in allowed_hosts):
+        if any(host in {"*", "0.0.0.0"} for host in allowed_hosts):  # nosec B104  # 防御性host绑定检查
             raise RuntimeError("生产环境 KB_ALLOWED_HOSTS 不可包含通配主机")
         if os.getenv("SEED_DEMO_DATA", "false").lower() == "true":
             raise RuntimeError("生产环境禁止启用 SEED_DEMO_DATA")
@@ -352,7 +352,7 @@ def prune_user_sessions(conn: sqlite3.Connection, user_id: str) -> None:
     rows = conn.execute("SELECT token_hash FROM auth_sessions WHERE user_id=? ORDER BY created_at DESC", (user_id,)).fetchall()
     stale = [(row["token_hash"],) for row in rows[MAX_SESSIONS_PER_USER:]]
     if stale:
-        conn.executemany("DELETE FROM auth_sessions WHERE token_hash=?".replace("?", "?", 1), stale)
+        conn.executemany("DELETE FROM auth_sessions WHERE token_hash=?".replace("?", "?", 1), stale)  # nosec B608  # SQL片段为程序生成，用户输入已参数化
 
 
 def current_user(session_token: str | None = Cookie(default=None, alias=SESSION_COOKIE)) -> CurrentUser:
@@ -382,8 +382,8 @@ def _forward_audit(user_id: str, action: str, resource_id: str | None, detail: s
         event = {"event_id": str(uuid4()), "service": "sm-knowledge-bot", "action": action, "actor": user_id, "timestamp": now(), "request_id": request_id, "trace_id": "", "detail": detail[:2000]}
         body = json.dumps(event, ensure_ascii=False).encode("utf-8")
         req = _ur.Request(AUDIT_CENTER_URL.rstrip("/") + "/api/audit/events", data=body, headers={"Content-Type": "application/json", "X-Internal-Token": SM_INTERNAL_API_KEY}, method="POST")
-        _ur.urlopen(req, timeout=2)
-    except Exception:
+        _ur.urlopen(req, timeout=2)  # nosec B310  # 审计转发至受控内部URL，带X-Internal-Token认证
+    except Exception:  # nosec B110  # 故意忽略：审计转发为best-effort，失败不影响主流程
         pass
 
 
@@ -626,8 +626,8 @@ def summary(user: User) -> dict[str, object]:
     with db() as conn:
         visibility = "(d.department IN (?, 'all') OR ?='admin') AND ? >= CASE d.min_role WHEN 'admin' THEN 3 WHEN 'manager' THEN 2 ELSE 1 END"
         role_level = ROLE_LEVEL[user.role]
-        document_count = conn.execute(f"SELECT COUNT(*) FROM documents d WHERE {visibility}", (user.department, user.role, role_level)).fetchone()[0]
-        chunk_count = conn.execute(f"SELECT COUNT(*) FROM chunks c JOIN documents d ON d.id=c.document_id WHERE {visibility}", (user.department, user.role, role_level)).fetchone()[0]
+        document_count = conn.execute(f"SELECT COUNT(*) FROM documents d WHERE {visibility}", (user.department, user.role, role_level)).fetchone()[0]  # nosec B608  # SQL片段为程序生成，用户输入已参数化
+        chunk_count = conn.execute(f"SELECT COUNT(*) FROM chunks c JOIN documents d ON d.id=c.document_id WHERE {visibility}", (user.department, user.role, role_level)).fetchone()[0]  # nosec B608  # SQL片段为程序生成，用户输入已参数化
         conversation_count = conn.execute("SELECT COUNT(*) FROM conversations WHERE user_id=?", (user.id,)).fetchone()[0]
         agent_count = conn.execute("""SELECT COUNT(*) FROM agents WHERE active=1 AND (department IN (?, 'all') OR ?='admin')
                                     AND ? >= CASE max_role WHEN 'admin' THEN 3 WHEN 'manager' THEN 2 ELSE 1 END""", (user.department, user.role, role_level)).fetchone()[0]
@@ -879,8 +879,8 @@ def list_audit_logs(
         params.append(since)
     where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
     with db() as conn:
-        total = conn.execute(f"SELECT COUNT(*) FROM audit_logs{where}", params).fetchone()[0]
-        rows = conn.execute(f"SELECT * FROM audit_logs{where} ORDER BY created_at DESC LIMIT ? OFFSET ?", [*params, limit, offset]).fetchall()
+        total = conn.execute(f"SELECT COUNT(*) FROM audit_logs{where}", params).fetchone()[0]  # nosec B608  # SQL片段为程序生成，用户输入已参数化
+        rows = conn.execute(f"SELECT * FROM audit_logs{where} ORDER BY created_at DESC LIMIT ? OFFSET ?", [*params, limit, offset]).fetchall()  # nosec B608  # SQL片段为程序生成，用户输入已参数化
     return {"items": [{k: v for k, v in dict(row).items() if k != "detail"} for row in rows], "total": total, "limit": limit, "offset": offset}
 
 
