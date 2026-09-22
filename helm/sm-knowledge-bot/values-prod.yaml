@@ -1,0 +1,27 @@
+# prod 环境覆盖值
+replicaCount: 3
+image:
+  tag: ""
+config:
+  SM_ENV: production
+  SM_LOG_LEVEL: warn
+ingress:
+  hosts:
+    - host: sm-knowledge-bot.sm.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls:
+    - secretName: sm-tls
+      hosts:
+        - sm-knowledge-bot.sm.example.com
+hpa:
+  minReplicas: 3
+  maxReplicas: 10
+resources:
+  requests:
+    cpu: 200m
+    memory: 256Mi
+  limits:
+    cpu: "1"
+    memory: 512Mi

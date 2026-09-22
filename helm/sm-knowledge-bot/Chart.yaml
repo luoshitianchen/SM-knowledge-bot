@@ -1,0 +1,12 @@
+apiVersion: v2
+name: sm-knowledge-bot
+description: SM-* 微服务 Helm Chart - 知识问答机器人服务
+type: application
+version: 1.0.0
+appVersion: "2.1.0"
+keywords:
+  - sm-microservices
+  - storage-governance
+  - enterprise
+maintainers:
+  - name: sm-platform-team

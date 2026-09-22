@@ -1,0 +1,16 @@
+# Chaos Mesh 实验：随机杀死 sm-knowledge-bot 的一个 Pod，验证自愈与可用性
+apiVersion: chaos-mesh.org/v1alpha1
+kind: PodChaos
+metadata:
+  name: sm-knowledge-bot-pod-kill
+  namespace: sm-prod
+spec:
+  action: pod-kill
+  mode: one
+  selector:
+    namespaces:
+      - sm-prod
+    labelSelectors:
+      app.kubernetes.io/name: sm-knowledge-bot
+  scheduler:
+    cron: "@weekly"     # 每周一次，需在运维窗口内执行；演练时可改为立即触发
